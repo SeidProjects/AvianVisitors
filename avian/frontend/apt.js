@@ -180,12 +180,30 @@
     });
   });
 
+  var atlasPoseEl = document.getElementById('atlasPoseToggle');
+  var atlasPoseBtns = atlasPoseEl ? [].slice.call(atlasPoseEl.querySelectorAll('button')) : [];
+  window.__atlasCardPose = readLS('bird:atlasCardPose', '1');
+  if (window.__atlasCardPose !== '2') window.__atlasCardPose = '1';
+  atlasPoseBtns.forEach(function (b) {
+    b.setAttribute('aria-current', (b.dataset.pose === window.__atlasCardPose) ? 'true' : 'false');
+  });
+  atlasPoseBtns.forEach(function (b) {
+    b.addEventListener('click', function () {
+      atlasPoseBtns.forEach(function (x) { x.setAttribute('aria-current', x === b ? 'true' : 'false'); });
+      window.__atlasCardPose = b.dataset.pose === '2' ? '2' : '1';
+      writeLS('bird:atlasCardPose', window.__atlasCardPose);
+      syncPill(atlasPoseEl);
+      renderAtlas(true);
+    });
+  });
+
   // Open-space click advances these segmented toggles to the next option.
   wireToggleAdvance(slider);
   wireToggleAdvance(winPick);
   wireToggleAdvance(atlasSortEl);
+  wireToggleAdvance(atlasPoseEl);
   wireToggleAdvance(document.getElementById('modalPoseToggle'));
-  function syncAllPills() { syncPill(slider); syncPill(winPick); if (atlasSortEl) syncPill(atlasSortEl); }
+  function syncAllPills() { syncPill(slider); syncPill(winPick); if (atlasSortEl) syncPill(atlasSortEl); if (atlasPoseEl) syncPill(atlasPoseEl); }
   // The buttons size from text content; wait for fonts so width is correct.
   if (document.fonts && document.fonts.ready) {
     document.fonts.ready.then(syncAllPills);
@@ -1155,9 +1173,10 @@
       var win = winBySci[s.sci] || 0;
       var firstMs = Date.parse((s.first_seen || '').replace(' ', 'T'));
       var isLifer = !isAllWindow && !isNaN(firstMs) && firstMs >= windowStartMs;
-      var sketchSrc = './avian/api/cutout.php?sci=' + encodeURIComponent(s.sci) +
-        (s.com ? '&com=' + encodeURIComponent(s.com) : '') +
-        '&v=' + SKETCH_VERSION;
+      var requestedPose = window.__atlasCardPose === '2' ? 2 : 1;
+      var cardPose = (requestedPose === 2 && DIMS[slugify(s.sci) + '-2']) ? 2 : 1;
+      var sketchUrl = sketchSrc(s.sci, cardPose);
+      var fallbackSketchUrl = cardPose > 1 ? sketchSrc(s.sci, 1) : '';
       var audioSrc = './avian/api/recording.php?sci=' + encodeURIComponent(s.sci);
       // The "all time" window makes the windowed count identical to the
       // all-time count - collapse to a single stat rather than print the
@@ -1171,7 +1190,7 @@
         +   (isLifer ? '<span class="lifer-badge" title="new to the life list in this window">lifer</span>' : '')
         +   '<div class="stat">' + statRows + '</div>'
         +   '<div class="img-wrap">'
-        +     '<img loading="lazy" decoding="async" src="' + sketchSrc + '" alt="' + s.com + '">'
+        +     '<img loading="lazy" decoding="async" src="' + sketchUrl + '" alt="' + s.com + '"' + (fallbackSketchUrl ? ' data-fallback-src="' + fallbackSketchUrl + '"' : '') + '>'
         +   '</div>'
         +   '<h3>' + s.com + '</h3>'
         +   '<div class="sci">' + s.sci + '</div>'
@@ -1185,6 +1204,15 @@
         +   '</div>'
         + '</article>';
     }).join('');
+
+    grid.querySelectorAll('img[data-fallback-src]').forEach(function (img) {
+      img.addEventListener('error', function () {
+        var fallback = img.getAttribute('data-fallback-src');
+        if (!fallback) return;
+        img.removeAttribute('data-fallback-src');
+        img.src = fallback;
+      });
+    });
 
     // Wire audio playback + spectrogram load.
     // - Only one card plays at a time. Clicking play on a different card
@@ -2012,9 +2040,9 @@
       results.filter(function (r) { return !r.ok; }).forEach(function (r) {
         r.btn.setAttribute('data-unavailable', 'true');
       });
-      // Default to the highest-numbered available pose (in-flight if
-      // present, else fall back to perched).
-      var pick = available.sort(function (a, b) { return b.pose - a.pose; })[0];
+      // Prefer perched on open; the toggle remains available for flight
+      // when that pose exists.
+      var pick = available.filter(function (r) { return r.pose === 1; })[0] || available[0];
       if (pick) {
         poseBtns.forEach(function (b) {
           b.setAttribute('aria-current', b === pick.btn ? 'true' : 'false');
