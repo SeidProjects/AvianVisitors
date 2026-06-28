@@ -591,6 +591,35 @@
     text-transform: uppercase;
   }
 
+  .farm-return {
+    position: fixed; left: 24px; bottom: 28px; z-index: 29;
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 9px 13px 9px 11px;
+    color: var(--ink-soft); text-decoration: none;
+    background: color-mix(in srgb, var(--paper) 84%, transparent);
+    border-radius: 999px;
+    box-shadow: var(--raised);
+    font: 10px/1 ui-monospace, Menlo, monospace;
+    letter-spacing: 0.12em; text-transform: lowercase;
+    transition: color 160ms ease, transform 160ms ease, background 160ms ease;
+  }
+  .farm-return svg {
+    width: 14px; height: 14px; flex: 0 0 auto;
+  }
+  .farm-return:hover {
+    color: var(--ink);
+    background: var(--paper);
+    transform: translateX(-2px);
+  }
+  @media (max-width: 700px) {
+    .farm-return {
+      left: 14px; bottom: 82px;
+      padding: 8px 10px 8px 9px;
+      letter-spacing: 0.08em;
+    }
+    .farm-return span { display: none; }
+  }
+
   /* Page header is now shared at .stage > .static-head - see top of CSS. */
   /* Stats grid: charts stack on the LEFT, text sections on the RIGHT.
      Each chart is a full-bleed card; each text section is a list with
