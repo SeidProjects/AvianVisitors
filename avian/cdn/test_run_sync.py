@@ -505,7 +505,7 @@ class CycleTests(unittest.TestCase):
         self.assertEqual(self.client.meta.events.callbacks, {})
         self.assertEqual(self.client.objects['data/snapshot-index.json'][0], selected)
         self.assertTrue(all(method == 'GET' for method, _ in self.client.calls[before:]))
-        with sqlite3.connect(adoption_state / 'ledger.sqlite') as adopted:
+        with contextlib.closing(sqlite3.connect(adoption_state / 'ledger.sqlite')) as adopted:
             self.assertEqual(adopted.execute('SELECT COUNT(*) FROM cdn_cache_graph').fetchone()[0], 1)
             self.assertEqual(adopted.execute('SELECT COUNT(*) FROM cdn_cache_aux').fetchone()[0], 1)
 
