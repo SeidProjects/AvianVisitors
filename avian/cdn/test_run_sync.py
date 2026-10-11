@@ -166,6 +166,26 @@ class CycleTests(unittest.TestCase):
         self.assertEqual(result['cache']['pending_generation'], None)
         self.assertEqual(self.client.meta.events.callbacks, {})
 
+    def test_verified_audio_and_mapped_art_stay_on_cdn_after_local_retention(self):
+        audio = self.source('clip.mp3', b'previously verified audio')
+        image = self.source('pose.png', b'previously verified artwork', 'images')
+        self.detection('clip.mp3')
+        self.public_inputs(mapping={'images': {self.sci: {'pose1': {'root': 'images', 'path': 'pose.png'}}}})
+        self.cycle()
+        initial = self.payload(self.cache(), 'species', self.sci)
+        media_keys = {key for key in self.client.objects if key.startswith(('audio/', 'images/'))}
+        audio.unlink(); image.unlink()
+        before = len(self.client.calls)
+        with patch.object(sync_media.os, 'read', side_effect=AssertionError('retained media rehash')):
+            self.cycle()
+        current = self.payload(self.cache(), 'species', self.sci)
+        self.assertEqual(current['detections'][0]['media'], initial['detections'][0]['media'])
+        self.assertTrue(current['detections'][0]['media']['available'])
+        self.assertEqual(current['media_images'], initial['media_images'])
+        self.assertTrue(current['media_images']['pose1']['available'])
+        self.assertTrue(media_keys <= self.client.objects.keys())
+        self.assertFalse(any(key.startswith(('audio/', 'images/')) for method, key in self.client.calls[before:]))
+
     def test_all_historical_audio_and_unmapped_images_progress_outside_modal500(self):
         for number in range(505):
             name = 'historical-%04d.mp3' % number

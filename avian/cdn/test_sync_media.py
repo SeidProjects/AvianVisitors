@@ -440,13 +440,100 @@ class SyncTests(unittest.TestCase):
         self.assertTrue(all(value <= 4 for value in scanned))
         self.assertEqual(len([call for call in self.client.calls if call[0] == 'PUT']), 36)
 
-    def test_missing_local_file_is_not_current_but_cloud_receipt_is_retained(self):
+    def test_verified_media_remains_available_after_local_retention_without_reads_or_writes(self):
         path = self.source()
+        image = self.source('pose.png', b'synthetic-artwork', 'images')
         self.batch()
+        receipts = self.receipts()
+        path.unlink(); image.unlink()
+        calls, changes = list(self.client.calls), self.ledger.total_changes
+        with patch.object(sync.os, 'read', side_effect=AssertionError('retained media reads source bytes')):
+            self.assertEqual(self.receipts(), receipts)
+        self.assertEqual(self.client.calls, calls)
+        self.assertEqual(self.ledger.total_changes, changes)
+        self.assertEqual(len(self.client.objects), 2)
+        self.assertEqual(self.ledger.execute("SELECT COUNT(*) FROM media_sync_objects WHERE status='verified'").fetchone()[0], 2)
+
+    def test_missing_intermediate_directory_keeps_verified_association(self):
+        path = self.source('day/clip.mp3')
+        self.batch(); receipt = self.receipts()
+        path.unlink(); path.parent.rmdir()
+        self.assertEqual(self.receipts(), receipt)
+
+    def test_retained_source_reappearance_or_changed_file_never_uses_old_association(self):
+        path = self.source()
+        self.batch(); old_key = self.receipts()[0]['key']
+        path.unlink()
+        original_stat, leaf_checks = sync.os.stat, []
+        def reappear(name, *args, **kwargs):
+            if name == 'clip.mp3' and 'dir_fd' in kwargs:
+                leaf_checks.append(name)
+                if len(leaf_checks) == 2:
+                    path.write_bytes(b'reappeared different source')
+            return original_stat(name, *args, **kwargs)
+        with patch.object(sync.os, 'stat', side_effect=reappear):
+            self.assertEqual(self.receipts(), [])
+        self.assertGreaterEqual(len(leaf_checks), 2)
+        self.assertEqual(self.receipts(), [])
+        self.batch()
+        self.assertNotEqual(self.receipts()[0]['key'], old_key)
+        self.assertIn(old_key, self.client.objects)
+
+    def test_changed_pending_source_removed_before_reverification_does_not_restore_old_name(self):
+        path = self.source(); self.batch()
+        old_key = self.receipts()[0]['key']
+        path.write_bytes(b'changed source not yet associated')
+        sync.discover(self.config, self.ledger, self.guard(), outer_lock_held=True)
+        self.assertEqual(self.ledger.execute('SELECT status FROM media_sync_sources').fetchone()[0], 'pending')
         path.unlink()
         self.assertEqual(self.receipts(), [])
+        self.assertEqual(self.ledger.execute('SELECT status FROM media_sync_objects WHERE key=?', (old_key,)).fetchone()[0], 'verified')
+        self.assertIn(old_key, self.client.objects)
+
+    def test_permission_error_and_unsafe_leaf_are_not_local_retention(self):
+        path = self.source()
+        self.batch()
+        original_stat = sync.os.stat
+        def denied(name, *args, **kwargs):
+            if name == 'clip.mp3' and 'dir_fd' in kwargs:
+                raise PermissionError('synthetic source denial')
+            return original_stat(name, *args, **kwargs)
+        with patch.object(sync.os, 'stat', side_effect=denied):
+            self.assertEqual(self.receipts(), [])
+        path.unlink()
+        outside = self.root / 'outside.mp3'; outside.write_bytes(b'synthetic-audio')
+        path.symlink_to(outside)
+        self.assertEqual(self.receipts(), [])
         self.assertEqual(len(self.client.objects), 1)
-        self.assertEqual(self.ledger.execute('SELECT status FROM media_sync_objects').fetchone()[0], 'verified')
+
+    def test_root_replacement_during_missing_confirmation_rejects_durable_identity(self):
+        path = self.source(); self.batch(); path.unlink()
+        original_bound, checks = sync._bound, []
+        def replace_root(config, ledger):
+            checks.append(True)
+            if len(checks) == 2:
+                self.audio.rename(self.root / 'old-audio'); self.audio.mkdir()
+            return original_bound(config, ledger)
+        with patch.object(sync, '_bound', side_effect=replace_root):
+            with self.assertRaises(sync.ConfigError):
+                self.receipts()
+        self.assertEqual(len(self.client.objects), 1)
+
+    def test_ancestor_replacement_during_missing_confirmation_is_denied(self):
+        path = self.source('day/clip.mp3'); self.batch(); path.unlink()
+        original_stat, leaf_checks = sync.os.stat, []
+        def replace_ancestor(name, *args, **kwargs):
+            if name == 'clip.mp3' and 'dir_fd' in kwargs:
+                leaf_checks.append(True)
+                if len(leaf_checks) == 3:
+                    path.parent.rename(self.audio / 'old-day')
+                    path.parent.mkdir()
+                    path.write_bytes(b'new source inside replaced directory')
+            return original_stat(name, *args, **kwargs)
+        with patch.object(sync.os, 'stat', side_effect=replace_ancestor):
+            self.assertEqual(self.receipts(), [])
+        self.assertEqual(len(leaf_checks), 3)
+        self.assertEqual(len(self.client.objects), 1)
 
     def test_retained_missing_oldest_queue_rows_are_tombstoned_without_starving_history(self):
         for number in range(36):

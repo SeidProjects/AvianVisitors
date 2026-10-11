@@ -915,8 +915,74 @@ def catalog_status(config, ledger):
                 remote_byte_cap=config.max_remote_media_bytes)
 
 
+def _verified_source_absent(config, ledger, kind, relative, mounts, guard=None):
+    """Confirm local retention beneath the physical root sealed in the ledger.
+
+    A second nofollow lookup rejects reappearance. Open ancestor identities are
+    checked against their still-current entries, so a moved/replaced directory
+    cannot turn an inaccessible or different source into retained media.
+    """
+    _bound(config, ledger)
+    sealed = json.loads(ledger.execute('SELECT identity FROM media_sync_target WHERE id=1').fetchone()[0])[3][kind][1]
+    root = config.roots[kind]
+    parts = _parts(relative)
+    fds, edges = [], []
+    try:
+        fd = os.open(root, DIRECTORY_FLAGS)
+        fds.append(fd)
+        info = os.fstat(fd)
+        if [info.st_dev, info.st_ino, info.st_uid] != sealed:
+            raise ConfigError('verified source root differs from its ledger seal')
+        full = root
+        missing = None
+        for number, part in enumerate(parts):
+            if guard is not None:
+                guard.check()
+            full = full / part
+            if str(full) in mounts or os.path.ismount(full):
+                raise UnsafeSource('nested source mount is ineligible')
+            try:
+                if number == len(parts) - 1:
+                    os.stat(part, dir_fd=fd, follow_symlinks=False)
+                    return False
+                child = os.open(part, DIRECTORY_FLAGS, dir_fd=fd)
+            except FileNotFoundError:
+                missing = (fd, part)
+                break
+            fds.append(child)
+            child_info = os.fstat(child)
+            if child_info.st_dev != sealed[0]:
+                raise UnsafeSource('source crosses a filesystem')
+            edges.append((fd, part, child))
+            fd = child
+        if missing is None:
+            return False
+        def stable_ancestors():
+            current = os.fstat(fds[0])
+            if [current.st_dev, current.st_ino, current.st_uid] != sealed:
+                raise UnsafeSource('verified source root changed')
+            for parent, name, child in edges:
+                linked = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                opened = os.fstat(child)
+                if not stat.S_ISDIR(linked.st_mode) or (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise UnsafeSource('verified source ancestor changed')
+        stable_ancestors()
+        _bound(config, ledger)
+        try:
+            os.stat(missing[1], dir_fd=missing[0], follow_symlinks=False)
+            return False
+        except FileNotFoundError:
+            pass
+        stable_ancestors()
+        _bound(config, ledger)
+        return True
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+
+
 def iter_verified_receipts(config, ledger, *, outer_lock_held, guard=None, predicate=None):
-    """Read-only current associations for a separate species/manifest adapter.
+    """Read-only verified associations, including locally retained cloud media.
 
     Relative source paths/fingerprints are private integration evidence. The
     public frontend/exporter must emit only its reviewed media field allowlist.
@@ -948,6 +1014,12 @@ def iter_verified_receipts(config, ledger, *, outer_lock_held, guard=None, predi
                 _safe_file(info)
                 if _json(_fingerprint(info)) != fingerprint:
                     continue
+        except FileNotFoundError:
+            try:
+                if not _verified_source_absent(config, ledger, kind, relative, mounts, guard):
+                    continue
+            except (OSError, UnsafeSource):
+                continue
         except (OSError, UnsafeSource):
             continue
         yield dict(kind=public_kind, root_label=kind,
