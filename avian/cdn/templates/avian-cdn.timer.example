@@ -1,0 +1,11 @@
+[Unit]
+Description=Repeat bounded bird CDN synchronization
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=15min
+AccuracySec=10s
+Unit=avian-cdn.service
+
+[Install]
+WantedBy=timers.target

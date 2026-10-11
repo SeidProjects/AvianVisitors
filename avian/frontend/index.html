@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-avian-config-required>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -11,6 +11,8 @@
      light on load. The full switcher lives in Settings (writes bird:theme). -->
 <script>try{if(localStorage.getItem('bird:theme')==='dark')document.documentElement.setAttribute('data-theme','dark');}catch(e){}</script>
 <link rel="stylesheet" href="./styles.css">
+<link rel="stylesheet" href="./avian/frontend/public-static.css">
+<link rel="stylesheet" href="./avian/frontend/seasonality.css">
 </head>
 <body class="av-local">
 <!-- Pill in the top-left slot, only visible on admin overlays
@@ -51,6 +53,7 @@
   <header class="static-head">
     <button type="button" class="pre" id="aboutLink">your birds</button>
     <h1 id="staticTitle">Heard Recently</h1>
+    <p id="snapshotFreshness" class="snapshot-freshness" role="status" aria-live="polite" hidden></p>
   </header>
   <div class="views" id="views">
 
@@ -118,6 +121,10 @@
       <div class="atlas-grid" id="atlasGrid"></div>
     </section>
 
+    <!-- ========== View 4 - Seasonality ========== -->
+    <section class="view" id="v3" aria-label="Seasonality">
+      <div id="seasonality"></div>
+    </section>
   </div>
 </main>
 
@@ -127,7 +134,7 @@
     <button class="modal-close" type="button" aria-label="Close" data-close="1">×</button>
     <div class="modal-grid">
       <div class="modal-img">
-        <img id="modalImg" src="" alt="" loading="eager">
+        <img id="modalImg" alt="" loading="eager" hidden>
         <div class="pose-toggle" id="modalPoseToggle" role="tablist" aria-label="Pose">
           <i class="seg-pill" aria-hidden="true"></i>
           <button type="button" data-pose="1" aria-label="perched">
@@ -199,6 +206,7 @@
   <button type="button" data-i="0" aria-current="true">collage</button>
   <button type="button" data-i="1">stats</button>
   <button type="button" data-i="2">atlas</button>
+  <button type="button" data-i="3" id="seasonalityTab" hidden>seasonality</button>
 </nav>
 
 
@@ -213,6 +221,9 @@
   </div>
 </section>
 
+<!-- The tracked default keeps local mode. The HTML marker fails closed if config cannot load. -->
+<script src="./avian/frontend/public-config.js"></script>
+<script src="./avian/frontend/seasonality.js"></script>
 <script src="./apt.js"></script>
 </body>
 </html>

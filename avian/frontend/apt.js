@@ -13,6 +13,592 @@
   var IMG_VERSION = 'r10'; // full library restyle: every species re-rendered
                            // with clean cutouts, so drop every cached copy.
 
+  // Optional CDN snapshots. Explicit false keeps the local application;
+  // partial or invalid requested settings stay unavailable, without fallback.
+  var publicConfigRequired = document.documentElement.hasAttribute('data-avian-config-required');
+  var PUBLIC_STATIC_MODE = (publicConfigRequired && typeof window.AVIAN_PUBLIC_STATIC_MODE !== 'boolean') ||
+    window.AVIAN_PUBLIC_STATIC_MODE === true ||
+    (window.AVIAN_PUBLIC_STATIC_MODE !== false &&
+      !!(window.AVIAN_MEDIA_ORIGIN || window.AVIAN_SNAPSHOT_INDEX_URL));
+  var MEDIA_CDN = PUBLIC_STATIC_MODE;
+  var MEDIA = { recordings: {}, latest_recording: {}, images: {} };
+  var mediaOrigin = '';
+  var mediaManifestLoaded = false;
+  if (MEDIA_CDN) {
+    try {
+      var configuredMediaUrl = new URL(window.AVIAN_MEDIA_ORIGIN || '');
+      if (configuredMediaUrl.protocol !== 'https:' || configuredMediaUrl.username ||
+          configuredMediaUrl.password || configuredMediaUrl.pathname !== '/' ||
+          configuredMediaUrl.search || configuredMediaUrl.hash ||
+          configuredMediaUrl.origin === location.origin) {
+        throw new Error('use a separate HTTPS CDN origin');
+      }
+      mediaOrigin = configuredMediaUrl.origin;
+    } catch (error) { console.warn('CDN media configuration unavailable', error); }
+  }
+  function mediaEntry(map, key) {
+    return map && Object.prototype.hasOwnProperty.call(map, key) ? map[key] : null;
+  }
+  function cdnMediaUrl(entry) {
+    var value = typeof entry === 'string' ? entry : entry && entry.url;
+    if (!mediaOrigin || typeof value !== 'string') return '';
+    try {
+      var u = new URL(value);
+      return u.protocol === 'https:' && u.origin === mediaOrigin && !u.username &&
+        !u.password && !u.hash ? u.href : '';
+    } catch (e) { return ''; }
+  }
+  function recordingSrc(file) {
+    return MEDIA_CDN ? cdnMediaUrl(mediaEntry(MEDIA.recordings, file)) :
+      './avian/api/recording.php?file=' + encodeURIComponent(file);
+  }
+  function latestRecordingSrc(sci) {
+    if (!MEDIA_CDN) return './avian/api/recording.php?sci=' + encodeURIComponent(sci);
+    var latest = mediaEntry(MEDIA.latest_recording, sci);
+    return latest && (cdnMediaUrl(latest) || recordingSrc(latest.file)) || '';
+  }
+  function birdImageSrc(sci, pose, com, version) {
+    var n = +pose || 1;
+    if (MEDIA_CDN) {
+      var images = mediaEntry(MEDIA.images, sci);
+      return cdnMediaUrl(mediaEntry(images, 'pose' + n));
+    }
+    return './avian/api/cutout.php?sci=' + encodeURIComponent(sci) +
+      (com ? '&com=' + encodeURIComponent(com) : '') +
+      '&v=' + version + (n > 1 ? '&pose=' + n : '');
+  }
+  function mediaAttr(value) {
+    return String(value || '').replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function mediaImageAttrs(url) {
+    return url ? ' src="' + mediaAttr(url) + '"' : ' hidden';
+  }
+  function setMediaImage(img, url) {
+    img.hidden = !url;
+    if (url) img.src = url;
+    else img.removeAttribute('src');
+  }
+  function probeSketch(sci, pose) {
+    var url = sketchSrc(sci, pose);
+    // The verified snapshot media references are authoritative; no
+    // per-visitor HEAD requests discover alternate CDN poses.
+    if (MEDIA_CDN) return Promise.resolve(!!url);
+    return fetch(url, { method: 'HEAD', cache: 'no-store' })
+      .then(function (r) { return r.ok; }).catch(function () { return false; });
+  }
+  // Media references are embedded in the verified schema-2 payloads.
+  function refreshMediaManifest() { return Promise.resolve(); }
+
+  // All routes in a refresh use the same captured snapshot index.
+  var SNAPSHOT_INDEX_URL = window.AVIAN_SNAPSHOT_INDEX_URL || '';
+  var SNAPSHOT_CDN = PUBLIC_STATIC_MODE;
+  var snapshotOrigin = '';
+  var snapshotCurrentIndex = null;
+  var snapshotIndexPending = null;
+  var snapshotObjectCache = new Map();
+  var snapshotObjectPending = new Map();
+  var snapshotLoadSequence = 0;
+  var snapshotAdoptSequence = 0;
+  var snapshotDetailSequence = 0;
+  var seasonalityController = null;
+  if (SNAPSHOT_CDN) {
+    try {
+      var configuredSnapshotUrl = new URL(SNAPSHOT_INDEX_URL);
+      if (configuredSnapshotUrl.protocol !== 'https:' || configuredSnapshotUrl.username ||
+          configuredSnapshotUrl.password || configuredSnapshotUrl.search || configuredSnapshotUrl.hash ||
+          configuredSnapshotUrl.origin === location.origin ||
+          !mediaOrigin || configuredSnapshotUrl.origin !== mediaOrigin) {
+        throw new Error('snapshot index must use the configured HTTPS media CDN origin');
+      }
+      snapshotOrigin = configuredSnapshotUrl.origin;
+    } catch (e) { console.warn('CDN snapshot configuration unavailable', e); }
+  }
+  function snapshotOwn(map, key) {
+    return map && Object.prototype.hasOwnProperty.call(map, key) ? map[key] : null;
+  }
+  function snapshotNormalizeRequest(request) {
+    if (!request || !['stats', 'lifelist', 'timeseries', 'firstseen', 'recent', 'species', 'seasonality'].includes(request.action)) {
+      throw new Error('unsupported snapshot action');
+    }
+    var normalized = { action: request.action };
+    var field = { timeseries: 'days', firstseen: 'limit', recent: 'hours', species: 'sci' }[request.action];
+    if (field) {
+      var fallback = { days: 30, limit: 10, hours: 24 }[field];
+      var value = request[field] == null ? fallback : request[field];
+      if (field === 'sci') {
+        if (typeof value !== 'string' || !value) throw new Error('snapshot species required');
+      } else if (!/^\d+$/.test(String(value)) || +value < 1) {
+        throw new Error('unsupported snapshot parameter');
+      }
+      normalized[field] = String(value);
+    }
+    return normalized;
+  }
+  function snapshotRequestFromUrl(url) {
+    var action = url.searchParams.get('action');
+    var request = { action: action };
+    var field = { timeseries: 'days', firstseen: 'limit', recent: 'hours', species: 'sci' }[action];
+    url.searchParams.forEach(function (value, key) {
+      if (key !== 'action' && key !== field) throw new Error('unsupported snapshot parameter');
+      if (url.searchParams.getAll(key).length !== 1) throw new Error('duplicate snapshot parameter');
+      if (key !== 'action') request[key] = value;
+    });
+    return snapshotNormalizeRequest(request);
+  }
+  function snapshotFetchBytes(url, maxBytes, cache) {
+    var controller = typeof AbortController === 'function' ? new AbortController() : null;
+    var timer;
+    var request = fetch(url, {
+      cache: cache, redirect: 'error', credentials: 'omit',
+      signal: controller ? controller.signal : undefined
+    }).then(function (response) {
+      if (!response.ok) {
+        var error = new Error('snapshot HTTP ' + response.status);
+        error.status = response.status;
+        throw error;
+      }
+      var length = response.headers && response.headers.get('Content-Length');
+      if (length && (!/^\d+$/.test(length) || +length > maxBytes)) {
+        if (controller) controller.abort();
+        throw new Error('snapshot response too large');
+      }
+      if (!response.body || typeof response.body.getReader !== 'function') {
+        throw new Error('bounded snapshot streaming unavailable');
+      }
+      var reader = response.body.getReader(), chunks = [], total = 0;
+      function read() {
+        return reader.read().then(function (part) {
+          if (part.done) {
+            var merged = new Uint8Array(total), offset = 0;
+            chunks.forEach(function (chunk) { merged.set(chunk, offset); offset += chunk.byteLength; });
+            return merged.buffer;
+          }
+          total += part.value.byteLength;
+          if (total > maxBytes) {
+            reader.cancel().catch(function () {});
+            if (controller) controller.abort();
+            throw new Error('snapshot response too large');
+          }
+          chunks.push(part.value);
+          return read();
+        });
+      }
+      return read();
+    }).then(function (bytes) {
+      if (bytes.byteLength > maxBytes) throw new Error('snapshot response too large');
+      return bytes;
+    });
+    var deadline = new Promise(function (_, reject) {
+      timer = setTimeout(function () {
+        if (controller) controller.abort();
+        reject(new Error('snapshot request timed out'));
+      }, 8000);
+    });
+    return Promise.race([request, deadline]).then(function (value) {
+      clearTimeout(timer); return value;
+    }, function (error) { clearTimeout(timer); throw error; });
+  }
+  function snapshotParseBytes(bytes) {
+    var value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid snapshot JSON');
+    return value;
+  }
+  function snapshotValidateIndex(index) {
+    if (![2, 3].includes(index.schema_version) || typeof index.generation !== 'string' || !index.generation ||
+        !Number.isFinite(Date.parse(index.published_at)) || !Number.isFinite(Date.parse(index.as_of)) ||
+        typeof index.timezone !== 'string' || !index.timezone || !index.compatibility ||
+        !index.routes || typeof index.routes !== 'object' || Array.isArray(index.routes) ||
+        !index.objects || typeof index.objects !== 'object' || Array.isArray(index.objects)) {
+      throw new Error('invalid snapshot index');
+    }
+    if (index.schema_version === 3) {
+      var actions = ['firstseen', 'lifelist', 'recent', 'seasonality', 'species', 'stats', 'timeseries'];
+      if (!Array.isArray(index.capabilities) || index.capabilities.length !== 1 ||
+          index.capabilities[0] !== 'seasonality-v1' ||
+          JSON.stringify(Object.keys(index.routes).sort()) !== JSON.stringify(actions) ||
+          !window.AvianSeasonality || typeof window.AvianSeasonality.validateIndex !== 'function') {
+        throw new Error('unsupported snapshot capability');
+      }
+      window.AvianSeasonality.validateIndex(index);
+    }
+    if (snapshotCurrentIndex && index.generation === snapshotCurrentIndex.generation &&
+        JSON.stringify(index) !== JSON.stringify(snapshotCurrentIndex)) {
+      throw new Error('published snapshot generation changed');
+    }
+    return index;
+  }
+  function snapshotFetchIndex() {
+    if (!snapshotOrigin) return Promise.reject(new Error('snapshot CDN unavailable'));
+    if (snapshotIndexPending) return snapshotIndexPending;
+    snapshotIndexPending = snapshotFetchBytes(SNAPSHOT_INDEX_URL, 1024 * 1024, 'no-cache')
+      .then(snapshotParseBytes).then(snapshotValidateIndex);
+    var pending = snapshotIndexPending;
+    pending.then(function () { snapshotIndexPending = null; }, function () { snapshotIndexPending = null; });
+    return pending;
+  }
+  function snapshotRoute(index, request) {
+    var path = snapshotOwn(index.routes, request.action);
+    if (request.action === 'seasonality') {
+      if (index.schema_version !== 3 || index.capabilities[0] !== 'seasonality-v1') {
+        throw new Error('seasonality is unavailable');
+      }
+    }
+    var field = { timeseries: 'days', firstseen: 'limit', recent: 'hours', species: 'sci' }[request.action];
+    if (field) path = snapshotOwn(path, request[field]);
+    if (typeof path !== 'string' || !/^objects\/[a-f0-9]{64}\.json$/.test(path)) {
+      throw new Error('snapshot route not published: ' + request.action);
+    }
+    var object = snapshotOwn(index.objects, path);
+    var hash = path.slice(8, -5);
+    if (!object || object.sha256 !== hash || !Number.isSafeInteger(object.bytes) ||
+        object.bytes < 2 || object.bytes > 8 * 1024 * 1024) throw new Error('invalid snapshot object reference');
+    var url = new URL(path, SNAPSHOT_INDEX_URL);
+    if (url.origin !== snapshotOrigin) throw new Error('invalid snapshot object origin');
+    return { path: path, url: url.href, hash: hash, bytes: object.bytes };
+  }
+  function snapshotGetObject(reference) {
+    if (snapshotObjectCache.has(reference.path)) {
+      var cached = snapshotObjectCache.get(reference.path);
+      if (cached.bytes !== reference.bytes) return Promise.reject(new Error('snapshot object size changed'));
+      snapshotObjectCache.delete(reference.path);
+      snapshotObjectCache.set(reference.path, cached);
+      return Promise.resolve(cached.payload);
+    }
+    if (snapshotObjectPending.has(reference.path)) {
+      var inFlight = snapshotObjectPending.get(reference.path);
+      return inFlight.bytes === reference.bytes ? inFlight.promise :
+        Promise.reject(new Error('snapshot object size changed'));
+    }
+    var pending = snapshotFetchBytes(reference.url, reference.bytes, 'force-cache').then(function (bytes) {
+      if (bytes.byteLength !== reference.bytes) throw new Error('snapshot object length mismatch');
+      if (typeof crypto === 'undefined' || !crypto.subtle) throw new Error('snapshot integrity verification unavailable');
+      return crypto.subtle.digest('SHA-256', bytes).then(function (digest) {
+        var hash = Array.from(new Uint8Array(digest)).map(function (n) { return n.toString(16).padStart(2, '0'); }).join('');
+        if (hash !== reference.hash) throw new Error('snapshot object checksum mismatch');
+        var payload = snapshotParseBytes(bytes);
+        snapshotObjectCache.set(reference.path, { bytes: reference.bytes, payload: payload });
+        while (snapshotObjectCache.size > 128) snapshotObjectCache.delete(snapshotObjectCache.keys().next().value);
+        return payload;
+      });
+    });
+    snapshotObjectPending.set(reference.path, { bytes: reference.bytes, promise: pending });
+    pending.then(function () { snapshotObjectPending.delete(reference.path); }, function () { snapshotObjectPending.delete(reference.path); });
+    return pending;
+  }
+  function snapshotHydrate(payload, index, action) {
+    var hydrated = Object.assign({}, payload);
+    if (action !== 'species') hydrated.as_of = index.as_of;
+    hydrated.snapshot = {};
+    ['schema_version', 'generation', 'published_at', 'as_of', 'timezone', 'compatibility',
+      'media_manifest_generation'].forEach(function (key) { hydrated.snapshot[key] = index[key]; });
+    if (index.capabilities) hydrated.snapshot.capabilities = index.capabilities.slice();
+    return hydrated;
+  }
+  // Reject structurally incomplete publisher output before adopting its index.
+  function snapshotValidatePayload(payload, request, index) {
+    function object(value) { return value && typeof value === 'object' && !Array.isArray(value); }
+    function invalid() { throw new Error('invalid snapshot payload: ' + request.action); }
+    function rows(value) {
+      if (!Array.isArray(value)) invalid();
+      value.forEach(function (row) {
+        if (!object(row)) invalid();
+        ['sci', 'com', 'first_seen', 'last_seen', 'file', 'd', 't', 'date'].forEach(function (field) {
+          if (row[field] != null && typeof row[field] !== 'string') invalid();
+        });
+        ['n', 'total', 'conf', 'detections', 'species', 'hour'].forEach(function (field) {
+          if (row[field] != null && (typeof row[field] !== 'number' || !Number.isFinite(row[field]))) invalid();
+        });
+      });
+    }
+    if (!object(payload)) invalid();
+    if (request.action === 'seasonality') {
+      if (!window.AvianSeasonality) invalid();
+      return window.AvianSeasonality.validatePayload(payload, request, index);
+    }
+    if (['lifelist', 'firstseen', 'recent'].includes(request.action)) {
+      rows(payload.species);
+      payload.species.forEach(function (bird) {
+        if (typeof bird.sci !== 'string' || !bird.sci) invalid();
+        if (bird.media_images != null && !object(bird.media_images)) invalid();
+        if (bird.latest_media != null && !object(bird.latest_media)) invalid();
+      });
+      if (request.action === 'recent' && String(payload.hours) !== request.hours) invalid();
+    } else if (request.action === 'timeseries') {
+      if (String(payload.days) !== request.days) invalid();
+      rows(payload.daily); rows(payload.by_hour);
+    } else if (request.action === 'species') {
+      if (payload.sci !== request.sci || !object(payload.summary)) invalid();
+      rows([payload.summary]); rows(payload.detections);
+    } else if (request.action === 'stats') {
+      ['totals', 'today', 'last_hour', 'week'].forEach(function (field) {
+        if (!object(payload[field])) invalid();
+        rows([payload[field]]);
+      });
+      if (payload.started != null && typeof payload.started !== 'string') invalid();
+    }
+    return payload;
+  }
+  function snapshotReadBatch(index, requests) {
+    var references = requests.map(function (request) { return snapshotRoute(index, request); });
+    return Promise.all(references.map(snapshotGetObject)).then(function (payloads) {
+      return payloads.map(function (payload, i) {
+        snapshotValidatePayload(payload, requests[i], index);
+        return snapshotHydrate(payload, index, requests[i].action);
+      });
+    }).catch(function (error) {
+      if (error.status === 404 || error.status === 410) error.retiredMetadata = true;
+      throw error;
+    });
+  }
+  function snapshotReadCachedBatch(index, requests) {
+    // Retention uses only complete, already verified browser objects. Old
+    // objects may have been removed from the current-only CDN dataset.
+    return requests.map(function (request) {
+      var reference = snapshotRoute(index, request);
+      var cached = snapshotObjectCache.get(reference.path);
+      if (!cached || cached.bytes !== reference.bytes) throw new Error('complete cached snapshot unavailable');
+      return snapshotHydrate(snapshotValidatePayload(cached.payload, request, index), index, request.action);
+    });
+  }
+  function snapshotPageRequests(hours) {
+    return [{ action: 'stats' }, { action: 'lifelist' },
+      { action: 'timeseries', days: 30 }, { action: 'firstseen', limit: 10 },
+      { action: 'recent', hours: hours }];
+  }
+  function snapshotSetStatus(state, index, error) {
+    window.__avianSnapshotStatus = {
+      state: state, generation: index ? index.generation : null,
+      published_at: index ? index.published_at : null, as_of: index ? index.as_of : null,
+      error: error ? error.message : null
+    };
+    renderSnapshotFreshness();
+  }
+  function loadSnapshots(requests, options) {
+    options = options || {};
+    try { requests = requests.map(snapshotNormalizeRequest); }
+    catch (error) { return Promise.reject(error); }
+    if (!SNAPSHOT_CDN) return Promise.reject(new Error('snapshot mode not enabled'));
+    if (options.pinCurrent && !snapshotCurrentIndex) return Promise.reject(new Error('snapshot generation not ready'));
+    var sequence = ++snapshotLoadSequence;
+    var recoveryAttempted = false, recoveryHours = null;
+    function ensureCurrentRequest() {
+      if (sequence < snapshotAdoptSequence || (options.accept && !options.accept()) ||
+          (recoveryHours !== null && recoveryHours !== currentHours)) {
+        var error = new Error('obsolete snapshot refresh'); error.obsolete = true; throw error;
+      }
+    }
+    function checkIndex(index) {
+      ensureCurrentRequest();
+      snapshotValidateIndex(index);
+      if (snapshotCurrentIndex && Date.parse(index.published_at) < Date.parse(snapshotCurrentIndex.published_at)) {
+        throw new Error('older snapshot pointer received');
+      }
+      return index;
+    }
+    function read(index, batch) {
+      try { return snapshotReadBatch(index, batch); }
+      catch (error) { return Promise.reject(error); }
+    }
+    function readRequested(index) {
+      return read(index, requests).then(function (parts) {
+        return { index: index, parts: parts };
+      }).catch(function (error) {
+        ensureCurrentRequest();
+        if (!error.retiredMetadata || recoveryAttempted) throw error;
+        recoveryAttempted = true;
+        recoveryHours = currentHours;
+        // A retired pinned detail needs the displayed page and requested
+        // routes from the same fresh index. This path retries exactly once.
+        return snapshotFetchIndex().then(checkIndex).then(function (current) {
+          return read(current, snapshotPageRequests(recoveryHours).map(snapshotNormalizeRequest).concat(requests))
+            .then(function (parts) {
+              return { index: current, parts: parts.slice(5), pageParts: parts.slice(0, 5) };
+            });
+        });
+      });
+    }
+    try { ensureCurrentRequest(); }
+    catch (error) { return Promise.reject(error); }
+    var initial = options.pinCurrent ? Promise.resolve(snapshotCurrentIndex) : snapshotFetchIndex().then(checkIndex);
+    return initial.then(readRequested).then(function (result) {
+      ensureCurrentRequest();
+      if (!options.pinCurrent || result.pageParts) {
+        checkIndex(result.index);
+        if (snapshotCurrentIndex && snapshotCurrentIndex.generation !== result.index.generation &&
+            typeof SPECIES_CACHE === 'object') SPECIES_CACHE = {};
+        snapshotCurrentIndex = result.index;
+        snapshotAdoptSequence = sequence;
+        if (result.pageParts) installSnapshotPage(result.pageParts, false, recoveryHours);
+        snapshotSetStatus('fresh', result.index);
+      }
+      return result.parts;
+    }).catch(function (error) {
+      if (error.obsolete) throw error;
+      ensureCurrentRequest();
+      if (!snapshotCurrentIndex) { snapshotSetStatus('unavailable', null, error); throw error; }
+      var retainedIndex = snapshotCurrentIndex;
+      snapshotSetStatus('retained', retainedIndex, error);
+      try { return snapshotReadCachedBatch(retainedIndex, requests); }
+      catch (unavailable) { throw error; }
+    });
+  }
+
+  // Optional public static mode. Data/media come only from verified CDN
+  // generations; private controls are a deliberate external link.
+  var publicWikiIndex = null;
+  var publicWikiPending = null;
+  function publicHttpsUrl(value) {
+    if (typeof value !== 'string' || !value) return '';
+    try {
+      var url = new URL(value);
+      return url.protocol === 'https:' && !url.username && !url.password ? url.href : '';
+    } catch (error) { return ''; }
+  }
+  function publicAdminUrl() { return publicHttpsUrl(window.AVIAN_PRIVATE_ADMIN_URL); }
+  function liveStreamSrc() {
+    return PUBLIC_STATIC_MODE ? publicHttpsUrl(window.AVIAN_LIVE_STREAM_URL) : '/stream?t=' + Date.now();
+  }
+  function snapshotMediaSrc(entry) {
+    return entry && entry.available === true ? cdnMediaUrl(entry) : '';
+  }
+  function recordingRowSrc(row) {
+    return SNAPSHOT_CDN ? cdnMediaUrl(row && row.dataset.audio) : recordingSrc(row && row.dataset.file);
+  }
+  function installPublicMedia(parts) {
+    if (!PUBLIC_STATIC_MODE) return;
+    var next = { recordings: {}, latest_recording: {}, images: {} };
+    var indexMetadata = parts[1] && parts[1].snapshot;
+    next.generation = indexMetadata ? indexMetadata.media_manifest_generation : null;
+    var species = (parts[1] && parts[1].species) || [];
+    species.forEach(function (bird) {
+      if (!bird.sci) return;
+      var images = {};
+      ['pose1', 'pose2'].forEach(function (pose) {
+        var entry = snapshotOwn(bird.media_images, pose);
+        if (snapshotMediaSrc(entry)) images[pose] = entry;
+      });
+      next.images[bird.sci] = images;
+      var latest = bird.latest_media;
+      if (snapshotMediaSrc(latest) && latest.file) {
+        next.latest_recording[bird.sci] = latest;
+        next.recordings[latest.file] = latest;
+      }
+    });
+    // Only called after a complete verified batch. A retained metadata
+    // generation therefore retains its matching media references too.
+    MEDIA = next;
+    mediaManifestLoaded = true;
+  }
+  function installSnapshotPage(parts, animate, forHours) {
+    installPublicMedia(parts);
+    DATA.stats = parts[0];
+    DATA.lifelist = parts[1];
+    DATA.timeseries = parts[2];
+    DATA.firstseen = parts[3];
+    if (forHours === currentHours && parts[4]) DATA.recent = parts[4];
+    recomputeDerived();
+    renderTimeIndependent(animate);
+    renderCollageFromData(animate);
+    syncSeasonalityIndex();
+  }
+  function seasonalityAvailable() {
+    return !!(SNAPSHOT_CDN && snapshotCurrentIndex && snapshotCurrentIndex.schema_version === 3 &&
+      snapshotCurrentIndex.capabilities && snapshotCurrentIndex.capabilities[0] === 'seasonality-v1' &&
+      window.AvianSeasonality);
+  }
+  function syncSeasonalityIndex() {
+    var available = seasonalityAvailable();
+    document.body.classList.toggle('seasonality-available', available);
+    var tab = document.getElementById('seasonalityTab');
+    if (tab) tab.hidden = !available;
+    if (seasonalityController) seasonalityController.setIndex(available ? snapshotCurrentIndex : null);
+    if (typeof slider !== 'undefined' && slider) syncPill(slider);
+    if (!available && typeof currentView === 'number' && currentView === 3) go(0);
+  }
+  function loadSeasonalityRoute(index, request) {
+    if (!seasonalityAvailable() || snapshotCurrentIndex.generation !== index.generation) {
+      var error = new Error('obsolete seasonality selection'); error.obsolete = true;
+      return Promise.reject(error);
+    }
+    return loadSnapshots([request], {pinCurrent: true, accept: function () {
+      return snapshotCurrentIndex && snapshotCurrentIndex.generation === index.generation;
+    }}).then(function (parts) { return parts[0]; });
+  }
+  function loadPublicWiki(sci) {
+    var url = publicHttpsUrl(window.AVIAN_WIKI_INDEX_URL);
+    if (!url || new URL(url).origin !== mediaOrigin) return Promise.resolve({ extract: '' });
+    if (!publicWikiIndex && !publicWikiPending) {
+      publicWikiPending = snapshotFetchBytes(url, 1024 * 1024, 'no-cache').then(snapshotParseBytes)
+        .then(function (index) {
+          if (index.schema_version !== 1 || !index.species || typeof index.species !== 'object' ||
+              Array.isArray(index.species)) throw new Error('invalid cached description index');
+          publicWikiIndex = index;
+        }).catch(function () {}).then(function () { publicWikiPending = null; });
+    }
+    return (publicWikiPending || Promise.resolve()).then(function () {
+      var entry = publicWikiIndex && snapshotOwn(publicWikiIndex.species, sci);
+      return entry && typeof entry.extract === 'string' ? Object.assign({}, entry) : { extract: '' };
+    });
+  }
+  function renderSnapshotFreshness() {
+    var element = document.getElementById('snapshotFreshness');
+    if (!element) return;
+    if (!PUBLIC_STATIC_MODE && !SNAPSHOT_CDN) { element.hidden = true; return; }
+    var status = window.__avianSnapshotStatus;
+    var state = status ? status.state : 'loading';
+    var text = 'Bird data is loading.';
+    if (status && status.as_of) {
+      var date = new Date(status.as_of);
+      var options = { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' };
+      if (snapshotCurrentIndex && snapshotCurrentIndex.timezone) options.timeZone = snapshotCurrentIndex.timezone;
+      var timestamp;
+      try { timestamp = date.toLocaleString(undefined, options); }
+      catch (error) { timestamp = date.toLocaleString(); }
+      // Default publication is every 15 minutes; allow five minutes of tolerance.
+      if (state === 'retained' || Date.now() - date.getTime() > 20 * 60 * 1000) {
+        state = state === 'retained' ? 'retained' : 'stale';
+        text = 'Updates delayed · data from ' + timestamp;
+      } else text = 'Updated ' + timestamp;
+      element.title = 'Bird observations as of ' + status.as_of;
+    } else if (state === 'unavailable') text = 'Bird data is unavailable.';
+    element.hidden = false;
+    element.setAttribute('data-state', state);
+    if (element.textContent !== text) element.textContent = text;
+  }
+  function renderPublicMenu() {
+    var admin = publicAdminUrl();
+    renderMenu(admin ? [{ label: 'administration', href: admin }] : []);
+    items.insertAdjacentHTML('afterbegin', themeRow());
+    var theme = items.querySelector('[data-theme-seg]');
+    if (theme) {
+      wireToggleAdvance(theme);
+      theme.addEventListener('click', function (event) {
+        var button = event.target.closest('button[data-theme]');
+        if (!button) return;
+        applyTheme(button.getAttribute('data-theme'));
+        [].forEach.call(theme.querySelectorAll('button'), function (other) {
+          other.setAttribute('aria-current', other === button ? 'true' : 'false');
+        });
+      });
+    }
+  }
+  function renderPublicAdministration() {
+    var admin = publicAdminUrl();
+    document.body.classList.add('admin-on');
+    adminEl.setAttribute('aria-hidden', 'false');
+    adminTitle.textContent = 'Administration';
+    adminBody.innerHTML = '<div class="admin-unreachable">' +
+      (admin ? 'Administration is available on the private site.<p><a class="chip ext" href="' +
+        mediaAttr(admin) + '" target="_blank" rel="noopener">open administration</a></p>' :
+        'Administration is unavailable here.') + '</div>';
+  }
+  renderSnapshotFreshness();
+  if (PUBLIC_STATIC_MODE || SNAPSHOT_CDN) setInterval(function () {
+    if (!document.hidden) renderSnapshotFreshness();
+  }, 60000);
+
   // ---- Sliding pill helper ----
   // Each segmented control has a single .seg-pill element that we move via
   // transform/width to whichever button currently has aria-current="true".
@@ -36,7 +622,7 @@
     container.addEventListener('click', function (ev) {
       if (ev.target.closest('button')) return;   // a specific option was clicked
       var btns = [].slice.call(container.querySelectorAll('button')).filter(function (b) {
-        return !b.disabled && b.getAttribute('data-unavailable') !== 'true';
+        return !b.hidden && !b.disabled && b.getAttribute('data-unavailable') !== 'true';
       });
       if (btns.length < 2) return;
       var cur = -1;
@@ -56,7 +642,7 @@
   // Each view's title text. The shared static-head shows one of these
   // based on the current view; identical adjacent values mean the title
   // stays put with no fade (collage and stats both say Heard Recently).
-  var VIEW_TITLES = ['Heard Recently', 'Heard Recently', 'Avian Visitors'];
+  var VIEW_TITLES = ['Heard Recently', 'Heard Recently', 'Avian Visitors', 'Seasonality'];
   var staticHead = document.querySelector('.static-head');
   var staticTitle = document.getElementById('staticTitle');
   function setTitleForView(i) {
@@ -85,7 +671,7 @@
   var STATS_LEAD = SLIDE_MS - 200;    // stats - begin a touch sooner
   var currentView = 0;                // collage shows first (no go() needed)
   function go(i) {
-    i = Math.max(0, Math.min(2, i));
+    i = Math.max(0, Math.min(seasonalityAvailable() ? 3 : 2, i));
     // Only a genuine view *switch* replays the entrance. go() also fires when
     // a card is expanded (it sets the #sci= hash, which routes through go(2))
     // while already on the atlas - that must not retrigger the load-in.
@@ -95,6 +681,11 @@
     btns.forEach(function (b, j) { b.setAttribute('aria-current', j === i ? 'true' : 'false'); });
     syncPill(slider);
     setTitleForView(i);
+    document.body.classList.toggle('seasonality-on', i === 3);
+    if (seasonalityController) {
+      if (i === 3) seasonalityController.show();
+      else seasonalityController.hide();
+    }
     if (!switching) return;
     // Replay the view's entrance animation on switch (collage bloom,
     // stats left-to-right, atlas row-by-row).
@@ -440,6 +1031,8 @@
         pose = (DIMS[base + '-2'] && Math.random() < FLY_PROB) ? 2 : 1;
         collagePose[s.sci] = pose;
       }
+      if (MEDIA_CDN && !birdImageSrc(s.sci, pose)) pose = 1;
+      if (MEDIA_CDN && !birdImageSrc(s.sci, pose)) return null;
       var slug = pose === 2 ? base + '-2' : base;
       var mask = loadMask(slug);
       if (!mask && pose === 2) { pose = 1; slug = base; mask = loadMask(slug); collagePose[s.sci] = 1; }
@@ -452,6 +1045,10 @@
         score: Math.pow(Math.max(1, n), T.countExp),
       };
     }).filter(Boolean);
+    if (MEDIA_CDN && !tiles.length) {
+      collage.innerHTML = '<p class="empty">bird images unavailable.</p>';
+      return;
+    }
     // Reroll on re-entry: forget pose choices for species no longer in window.
     var present = {}; items.forEach(function (s) { present[s.sci] = 1; });
     Object.keys(collagePose).forEach(function (k) { if (!present[k]) delete collagePose[k]; });
@@ -539,10 +1136,7 @@
       // com flows through so the worker's JIT Gemini job uses the right
       // common name in its prompt for a freshly-detected species.
       // &v=IMG_VERSION busts CF edge cache when we re-render any species.
-      var img = './avian/api/cutout.php?sci=' + encodeURIComponent(s.sci) +
-        (s.com ? '&com=' + encodeURIComponent(s.com) : '') +
-        (r.pose === 2 ? '&pose=2' : '') +
-        '&v=' + IMG_VERSION;
+      var img = birdImageSrc(s.sci, r.pose, s.com, IMG_VERSION);
       var btn = document.createElement('button');
       btn.className = 'gtile';
       btn.type = 'button';
@@ -559,7 +1153,7 @@
       btn.style.top    = r.y + 'px';
       btn.style.width  = r.fullW + 'px';
       btn.style.height = r.fullH + 'px';
-      btn.innerHTML = '<img loading="lazy" decoding="async" src="' + img + '" alt="' + s.com + '">';
+      btn.innerHTML = '<img loading="lazy" decoding="async"' + mediaImageAttrs(img) + ' alt="' + mediaAttr(s.com) + '">';
       r.el = btn;
       collage.appendChild(btn);
     });
@@ -844,7 +1438,18 @@
   // Map sci -> all-time detection count, populated from lifelist for atlas.
   var speciesTotals = {};
 
-  function fetchJson(url) {
+  function fetchJson(url, options) {
+    if (SNAPSHOT_CDN) {
+      try {
+        var requestedUrl = new URL(url, location.href);
+        if (requestedUrl.pathname.endsWith('/avian/api/birdnet-api.php')) {
+          var request = snapshotRequestFromUrl(requestedUrl);
+          return loadSnapshots([request], { pinCurrent: true, accept: options && options.accept })
+            .then(function (parts) { return parts[0]; });
+        }
+      } catch (error) { return Promise.reject(error); }
+    }
+    if (PUBLIC_STATIC_MODE) return Promise.reject(new Error('private API unavailable in CDN mode'));
     return fetch(url, { cache: 'no-store' })
       .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); });
   }
@@ -854,10 +1459,13 @@
     var byDate = {};
     (daily || []).forEach(function (row) { byDate[row.date] = row; });
     var out = new Array(days).fill(null).map(function () { return { detections: 0, species: 0 }; });
-    var today = new Date();
+    var clock = DATA.timeseries && DATA.timeseries.snapshot && DATA.timeseries.snapshot.as_of;
+    var calendar = SNAPSHOT_CDN && typeof clock === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(clock) ? clock.slice(0, 10) : '';
+    var today = calendar ? new Date(calendar + 'T00:00:00Z') : new Date();
     for (var i = 0; i < days; i++) {
       var d = new Date(today);
-      d.setDate(today.getDate() - (days - 1 - i));
+      if (calendar) d.setUTCDate(today.getUTCDate() - (days - 1 - i));
+      else d.setDate(today.getDate() - (days - 1 - i));
       var key = d.toISOString().slice(0, 10);
       if (byDate[key]) {
         out[i].detections = +byDate[key].detections || 0;
@@ -1155,10 +1763,8 @@
       var win = winBySci[s.sci] || 0;
       var firstMs = Date.parse((s.first_seen || '').replace(' ', 'T'));
       var isLifer = !isAllWindow && !isNaN(firstMs) && firstMs >= windowStartMs;
-      var sketchSrc = './avian/api/cutout.php?sci=' + encodeURIComponent(s.sci) +
-        (s.com ? '&com=' + encodeURIComponent(s.com) : '') +
-        '&v=' + SKETCH_VERSION;
-      var audioSrc = './avian/api/recording.php?sci=' + encodeURIComponent(s.sci);
+      var sketchUrl = birdImageSrc(s.sci, 1, s.com, SKETCH_VERSION);
+      var audioSrc = SNAPSHOT_CDN ? snapshotMediaSrc(s.latest_media) : latestRecordingSrc(s.sci);
       // The "all time" window makes the windowed count identical to the
       // all-time count - collapse to a single stat rather than print the
       // same number twice. Otherwise label the count with its span.
@@ -1167,19 +1773,19 @@
         : '<div><span class="n">' + fmtNK(win) + '</span><span class="lbl-inline">' + windowLabel(currentHours) + '</span></div>'
           + '<div><span class="n">' + fmtNK(total) + '</span><span class="lbl-inline">all time</span></div>';
       return ''
-        + '<article class="bird-card" data-sci="' + s.sci + '" data-audio="' + audioSrc + '">'
+        + '<article class="bird-card" data-sci="' + mediaAttr(s.sci) + '" data-audio="' + mediaAttr(audioSrc) + '">'
         +   (isLifer ? '<span class="lifer-badge" title="new to the life list in this window">lifer</span>' : '')
         +   '<div class="stat">' + statRows + '</div>'
         +   '<div class="img-wrap">'
-        +     '<img loading="lazy" decoding="async" src="' + sketchSrc + '" alt="' + s.com + '">'
+        +     '<img loading="lazy" decoding="async"' + mediaImageAttrs(sketchUrl) + ' alt="' + mediaAttr(s.com) + '">'
         +   '</div>'
         +   '<h3>' + s.com + '</h3>'
         +   '<div class="sci">' + s.sci + '</div>'
         +   '<div class="spectro-wrap" aria-hidden="true"></div>'
         +   '<div class="actions">'
-        +     '<button type="button" class="chip play" data-action="play" aria-label="play recording">'
-        +       ICON_PLAY + '<span>play</span>'
-        +     '</button>'
+        +     (PUBLIC_STATIC_MODE && !audioSrc
+          ? '<button type="button" class="chip play" data-action="play" disabled aria-label="recording unavailable" title="Recording unavailable"><span>unavailable</span></button>'
+          : '<button type="button" class="chip play" data-action="play" aria-label="play recording">' + ICON_PLAY + '<span>play</span></button>')
         +     '<a class="chip ext" href="' + wikiUrl(s.sci) + '" target="_blank" rel="noopener" aria-label="Wikipedia">wiki</a>'
         +     '<a class="chip ext" href="' + ebirdUrl(s.sci) + '" target="_blank" rel="noopener" aria-label="eBird">ebird</a>'
         +   '</div>'
@@ -1241,6 +1847,7 @@
         var card = btn.closest('.bird-card');
         if (btn === currentBtn) { stopCurrent(); return; }
         stopCurrent();
+        if (!card.dataset.audio) { setBtnState(btn, 'missing'); return; }
         audioClaim(stopCurrent);   // stop any modal-recording / live-stream audio
         setBtnState(btn, 'loading');
         currentBtn = btn;
@@ -1259,7 +1866,7 @@
           } else {
             var actx = getSpecCtx();
             if (actx) {
-              fetch(aurl)
+              fetch(aurl, MEDIA_CDN ? { redirect: 'error', credentials: 'omit' } : undefined)
                 .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.arrayBuffer(); })
                 .then(function (b) { return actx.decodeAudioData(b); })
                 .then(function (buf) {
@@ -1342,13 +1949,17 @@
   }
 
   function refreshRecent(animate) {
+    // A window change must not combine recent counts from one
+    // published generation with charts/lifelist from another.
+    if (SNAPSHOT_CDN) return refreshAll(animate);
     // Capture the window this fetch was issued for. If the user
     // changes the picker again before it resolves - or a slower poll
     // lands later - we discard the stale response so the collage
     // never reverts to a different window.
     var forHours = currentHours;
-    return fetchJson('./avian/api/birdnet-api.php?action=recent&hours=' + forHours)
-      .then(function (j) {
+    return Promise.all([refreshMediaManifest(), fetchJson('./avian/api/birdnet-api.php?action=recent&hours=' + forHours)])
+      .then(function (results) {
+        var j = results[1];
         if (forHours !== currentHours) return; // window changed mid-flight
         DATA.recent = j; renderWindowDependent(animate);
       })
@@ -1356,30 +1967,36 @@
   }
   function refreshAll(animate) {
     var forHours = currentHours;
-    return Promise.all([
+    var metadata = SNAPSHOT_CDN ? refreshMediaManifest().then(function () {
+      return loadSnapshots(snapshotPageRequests(forHours), { accept: function () { return forHours === currentHours; } });
+    }) : Promise.all([
       fetchJson('./avian/api/birdnet-api.php?action=stats').catch(function () { return null; }),
       fetchJson('./avian/api/birdnet-api.php?action=lifelist').catch(function () { return null; }),
       fetchJson('./avian/api/birdnet-api.php?action=timeseries&days=30').catch(function () { return null; }),
       fetchJson('./avian/api/birdnet-api.php?action=firstseen&limit=10').catch(function () { return null; }),
       fetchJson('./avian/api/birdnet-api.php?action=recent&hours=' + forHours).catch(function () { return null; }),
-    ]).then(function (parts) {
-      DATA.stats = parts[0];
-      DATA.lifelist = parts[1];
-      DATA.timeseries = parts[2];
-      DATA.firstseen = parts[3];
-      // Only accept the recent slice if the window hasn't changed
-      // since this poll started - otherwise keep what's there.
-      if (forHours === currentHours && parts[4]) DATA.recent = parts[4];
-      recomputeDerived();
-      renderTimeIndependent(animate);
-      renderCollageFromData(animate);
+    ]);
+    return Promise.all([refreshMediaManifest(), metadata]).then(function (results) {
+      installSnapshotPage(results[1], animate, forHours);
+    }).catch(function (error) {
+      // In snapshot mode preserve the last complete DATA set.
+      if (!error.obsolete) console.warn('BirdNET snapshot refresh unavailable', error);
     });
   }
 
   // Kick off the initial fetch. Renders pull from DATA as soon as it
   // populates; until then the page sits with empty histograms + lists.
   // animate=true so the collage blooms in on first load.
-  refreshAll(true);
+  var seasonalityRoot = document.getElementById('seasonality');
+  if (seasonalityRoot && window.AvianSeasonality && typeof window.AvianSeasonality.create === 'function') {
+    seasonalityController = window.AvianSeasonality.create({
+      root: seasonalityRoot,
+      getIndex: function () { return snapshotCurrentIndex; },
+      loadSeasonality: function (index) { return loadSeasonalityRoute(index, {action: 'seasonality'}); },
+      imageUrl: function (sci) { return sketchSrc(sci, 1); }
+    });
+  }
+  var publicInitialDataLoad = refreshAll(true);
 
   // Hook into the window picker so the data refetches on change. Pass
   // animate=true so the collage blooms (the silent poll passes nothing).
@@ -1415,6 +2032,122 @@
   });
   startPolling();
 
+  // Optional update signals. The verified CDN index remains authoritative.
+  var updatesUrl = '', updatesSocket = null, updatesReconnectTimer = null;
+  var updatesConnectTimer = null, updatesStableTimer = null, updatesRefreshTimer = null;
+  var updatesReconnectAttempt = 0, updatesRefreshing = false, updatesRefreshQueued = false;
+  var updatesLastHint = null;
+  if (PUBLIC_STATIC_MODE && snapshotOrigin && typeof WebSocket === 'function') {
+    try {
+      var configuredUpdatesUrl = window.AVIAN_UPDATES_URL;
+      if (typeof configuredUpdatesUrl === 'string' && configuredUpdatesUrl &&
+          configuredUpdatesUrl === configuredUpdatesUrl.trim() &&
+          !/[\x00-\x20\x7f\\?#]/.test(configuredUpdatesUrl)) {
+        var parsedUpdatesUrl = new URL(configuredUpdatesUrl);
+        if (parsedUpdatesUrl.protocol === 'wss:' && !parsedUpdatesUrl.username && !parsedUpdatesUrl.password) {
+          updatesUrl = parsedUpdatesUrl.href;
+        }
+      }
+    } catch (error) { /* Polling continues when optional configuration is invalid. */ }
+  }
+  function updatesHint(data) {
+    // The three wire fields are ASCII, so this also caps UTF-8 bytes at 1 KiB.
+    if (typeof data !== 'string' || data.length > 1024 || /[^\x00-\x7f]/.test(data)) return null;
+    try {
+      var hint = JSON.parse(data);
+      if (!hint || Array.isArray(hint) || Object.keys(hint).sort().join(',') !== 'as_of,generation,type' ||
+          hint.type !== 'updated' || typeof hint.generation !== 'string' ||
+          !/^[A-Za-z0-9_-]{1,80}$/.test(hint.generation) || typeof hint.as_of !== 'string' ||
+          !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/.test(hint.as_of) ||
+          !Number.isFinite(Date.parse(hint.as_of))) return null;
+      if (snapshotCurrentIndex && (hint.generation === snapshotCurrentIndex.generation ||
+          Date.parse(hint.as_of) <= Date.parse(snapshotCurrentIndex.as_of))) return null;
+      if (updatesLastHint && (hint.generation === updatesLastHint.generation ||
+          Date.parse(hint.as_of) < Date.parse(updatesLastHint.as_of))) return null;
+      return hint;
+    } catch (error) { return null; }
+  }
+  function queueUpdatesRefresh() {
+    if (!updatesUrl || document.hidden) return;
+    updatesRefreshQueued = true;
+    if (updatesRefreshing || updatesRefreshTimer) return;
+    updatesRefreshTimer = setTimeout(function () {
+      updatesRefreshTimer = null;
+      if (document.hidden || !updatesRefreshQueued) return;
+      updatesRefreshQueued = false; updatesRefreshing = true;
+      var before = snapshotCurrentIndex && snapshotCurrentIndex.generation;
+      var modal = document.getElementById('detail-modal');
+      var sci = modal.getAttribute('aria-hidden') === 'false' ? document.getElementById('modalSci').textContent : '';
+      var detailSequence = snapshotDetailSequence;
+      Promise.resolve().then(function () { return refreshAll(false); }).then(function () {
+        if (sci && !document.hidden && detailSequence === snapshotDetailSequence &&
+            modal.getAttribute('aria-hidden') === 'false' && document.getElementById('modalSci').textContent === sci &&
+            snapshotCurrentIndex && snapshotCurrentIndex.generation !== before) {
+          openDetailModal(sci, { refresh: true });
+        }
+      }).catch(function () { /* CDN refresh/polling owns the retained-data state. */ }).then(function () {
+        updatesRefreshing = false;
+        if (updatesRefreshQueued) queueUpdatesRefresh();
+      });
+    }, 2000);
+  }
+  function scheduleUpdatesReconnect() {
+    if (!updatesUrl || document.hidden || updatesReconnectTimer) return;
+    var base = Math.min(60000, 1000 * Math.pow(2, Math.min(updatesReconnectAttempt++, 6)));
+    var delay = Math.min(60000, Math.round(base * (1 + Math.random() * 0.25)));
+    updatesReconnectTimer = setTimeout(function () {
+      updatesReconnectTimer = null; startUpdates();
+    }, delay);
+  }
+  function clearUpdatesConnectionTimers() {
+    clearTimeout(updatesConnectTimer); clearTimeout(updatesStableTimer);
+    updatesConnectTimer = updatesStableTimer = null;
+  }
+  function startUpdates() {
+    if (!updatesUrl || document.hidden || updatesSocket || updatesReconnectTimer) return;
+    var socket;
+    try { socket = new WebSocket(updatesUrl); }
+    catch (error) { scheduleUpdatesReconnect(); return; }
+    updatesSocket = socket;
+    function failed() {
+      if (updatesSocket !== socket) return;
+      updatesSocket = null; clearUpdatesConnectionTimers();
+      try { socket.close(); } catch (error) { /* Already closed. */ }
+      scheduleUpdatesReconnect();
+    }
+    updatesConnectTimer = setTimeout(failed, 10000);
+    socket.onopen = function () {
+      if (updatesSocket !== socket) return;
+      clearTimeout(updatesConnectTimer); updatesConnectTimer = null;
+      // A flapping connection must not reset its backoff on every open.
+      updatesStableTimer = setTimeout(function () {
+        if (updatesSocket === socket) updatesReconnectAttempt = 0;
+      }, 30000);
+      queueUpdatesRefresh(); // Recover missed hints through the CDN.
+    };
+    socket.onmessage = function (event) {
+      if (updatesSocket !== socket || document.hidden) return;
+      var hint = updatesHint(event.data);
+      if (!hint) return;
+      updatesLastHint = hint; queueUpdatesRefresh();
+    };
+    socket.onerror = socket.onclose = failed;
+  }
+  function stopUpdates() {
+    clearTimeout(updatesReconnectTimer); clearTimeout(updatesRefreshTimer);
+    updatesReconnectTimer = updatesRefreshTimer = null; updatesRefreshQueued = false;
+    clearUpdatesConnectionTimers();
+    var socket = updatesSocket; updatesSocket = null;
+    if (socket) { try { socket.close(); } catch (error) { /* Already closed. */ } }
+  }
+  if (updatesUrl) {
+    document.addEventListener('visibilitychange', function () {
+      if (document.hidden) stopUpdates();
+      else { startUpdates(); queueUpdatesRefresh(); }
+    });
+    startUpdates();
+  }
+
   // ---- Menu dropdown ----
   var dd = document.getElementById('menu-dd');
   var menuBtn = document.getElementById('menuBtn');
@@ -1435,6 +2168,7 @@
   // request reaches PHP - so a 200 here means we're authed, a 401
   // means Caddy rejected and we need the lock-screen flow.
   function tryAutoUnlock() {
+    if (PUBLIC_STATIC_MODE) { renderPublicMenu(); return; }
     fetch('./avian/api/menu.php', { credentials: 'same-origin' }).then(function (r) {
       if (r.status === 200) {
         return r.json().then(function (j) { renderMenu(j.items || []); });
@@ -1445,6 +2179,7 @@
 
   document.getElementById('unlockForm').addEventListener('submit', function (e) {
     e.preventDefault();
+    if (PUBLIC_STATIC_MODE) { renderPublicMenu(); return; }
     // BirdNET-Pi's upstream Caddyfile basicauth user is `birdnet`.
     // If your install changed it (custom Caddyfile), set window.AV_AUTH_USER
     // before this script loads - e.g. an inline <script> in index.html.
@@ -1493,7 +2228,7 @@
       var label = (it.label || '');
       var attrs = it.native ? '' : ' target="_blank" rel="noopener"';
       var cls = it.native ? '' : ' class="ext"';
-      return '<a' + cls + ' href="' + it.href + '"' + attrs + '><span>' + label + '</span></a>';
+      return '<a' + cls + ' href="' + mediaAttr(it.href) + '"' + attrs + '><span>' + mediaAttr(label) + '</span></a>';
     }).join('');
     items.innerHTML =
       '<div class="live-audio" id="liveAudio" data-on="false">'
@@ -1543,7 +2278,10 @@
       // race a timeout because icecast can take 1-10s to warm up
       // depending on tunnel + bitrate.
       return new Promise(function (resolve, reject) {
-        liveEl = new Audio('/stream?t=' + Date.now());
+        var source = liveStreamSrc();
+        if (!source) { reject(new Error('Live audio is unavailable.')); return; }
+        liveEl = new Audio(source);
+        if (PUBLIC_STATIC_MODE && new URL(source).origin !== location.origin) liveEl.crossOrigin = 'anonymous';
         // No crossOrigin - the stream is same-origin via the worker
         // and crossOrigin='anonymous' would require CORS headers
         // icecast doesn't send.
@@ -1659,6 +2397,10 @@
       ctx.fillRect(0, 0, spectroEl.width, spectroEl.height);
     })();
 
+    if (PUBLIC_STATIC_MODE && !liveStreamSrc()) {
+      liveBtn.disabled = true;
+      setStatus('Live audio is unavailable.');
+    }
     liveBtn.addEventListener('click', function (ev) {
       // Important: stop the click from propagating up to the
       // document-level "click outside drawer" handler, which would
@@ -1670,7 +2412,7 @@
       liveBtn.innerHTML = stopIcon + '<span>stop</span>';
       setStatus('connecting...');
       startAudio()
-        .then(function () { setStatus('streaming from pi'); attachSpectrogram(); })
+        .then(function () { setStatus(PUBLIC_STATIC_MODE ? 'live audio' : 'streaming from pi'); attachSpectrogram(); })
         .catch(function (err) {
           stopAudio();
           var msg = (err && err.message) || 'stream unavailable';
@@ -1694,6 +2436,7 @@
   }
 
   function loadSettings() {
+    if (PUBLIC_STATIC_MODE) return;
     fetch('./avian/api/config.php', { credentials: 'same-origin', cache: 'no-store' })
       .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
       .then(function (cfg) {
@@ -1807,6 +2550,7 @@
   }
 
   function saveSettings() {
+    if (PUBLIC_STATIC_MODE) return;
     if (Object.keys(pending).length === 0) return;
     var body = JSON.stringify(pending);
     setSaveState('saving...');
@@ -1967,15 +2711,27 @@
     var sp = ((DATA.lifelist && DATA.lifelist.species) || [])
       .find(function (s) { return s.sci === sci; });
     var com = sp ? (sp.com || '') : '';
-    var base = './avian/api/cutout.php?sci=' + encodeURIComponent(sci) +
-      (com ? '&com=' + encodeURIComponent(com) : '') +
-      '&v=' + SKETCH_VERSION;
-    var n = +pose || 1;
-    return n > 1 ? base + '&pose=' + n : base;
+    return birdImageSrc(sci, pose, com, SKETCH_VERSION);
   }
-  function openDetailModal(sci) {
+  function openDetailModal(sci, options) {
     if (!sci) return;
+    var refreshingDetail = options && options.refresh;
+    if (PUBLIC_STATIC_MODE && !snapshotCurrentIndex && typeof publicInitialDataLoad === 'object' && publicInitialDataLoad) {
+      var waitingHash = readHash();
+      publicInitialDataLoad.then(function () {
+        if (snapshotCurrentIndex && (waitingHash !== sci || readHash() === sci)) openDetailModal(sci);
+      });
+      return;
+    }
+    var detailRecent = SNAPSHOT_CDN ? DATA.recent : null;
+    var detailGeneration = snapshotCurrentIndex && snapshotCurrentIndex.generation;
+    var detailSequence = ++snapshotDetailSequence;
     var modal = document.getElementById('detail-modal');
+    if (refreshingDetail) stopModalAudio();
+    function currentDetail() {
+      return detailSequence === snapshotDetailSequence &&
+        document.getElementById('modalSci').textContent === sci && modal.getAttribute('aria-hidden') === 'false';
+    }
     var img = document.getElementById('modalImg');
     var poseToggle = document.getElementById('modalPoseToggle');
     var poseBtns = [].slice.call(poseToggle.querySelectorAll('button'));
@@ -1989,24 +2745,31 @@
       b.setAttribute('aria-current', 'false');
     });
     var p1 = poseToggle.querySelector('button[data-pose="1"]');
-    if (p1) {
+    if (p1 && (!MEDIA_CDN || sketchSrc(sci, 1))) {
       p1.removeAttribute('data-unavailable');
       p1.setAttribute('aria-current', 'true');
     }
-    img.src = sketchSrc(sci, 1);
+    setMediaImage(img, sketchSrc(sci, 1));
     img.alt = sci;
 
     // Probe each pose's image with HEAD. Build a list of available
     // poses, then pick the highest-numbered as the default (in-flight
     // > perched, etc.). When only one pose remains, hide the toggle
     // entirely - no choice means no UI.
-    var probes = poseBtns.map(function (b) {
-      var pose = +b.dataset.pose;
-      return fetch(sketchSrc(sci, pose), { method: 'HEAD', cache: 'no-store' })
-        .then(function (r) { return { pose: pose, btn: b, ok: r.ok }; })
-        .catch(function () { return { pose: pose, btn: b, ok: false }; });
+    var posesReady = !MEDIA_CDN || mediaManifestLoaded ? Promise.resolve() : refreshMediaManifest();
+    posesReady.then(function () {
+      return Promise.all(poseBtns.map(function (b) {
+        var pose = +b.dataset.pose;
+        return probeSketch(sci, pose)
+          .then(function (ok) { return { pose: pose, btn: b, ok: ok }; });
+      }));
+    }).then(function (results) {
+      if (SNAPSHOT_CDN && snapshotCurrentIndex && snapshotCurrentIndex.generation !== detailGeneration) return;
+      updateDetailPoses(results);
     });
-    Promise.all(probes).then(function (results) {
+    function updateDetailPoses(results) {
+      if (SNAPSHOT_CDN && !currentDetail()) return;
+      if (document.getElementById('modalSci').textContent !== sci) return;
       var available = results.filter(function (r) { return r.ok; });
       available.forEach(function (r) { r.btn.removeAttribute('data-unavailable'); });
       results.filter(function (r) { return !r.ok; }).forEach(function (r) {
@@ -2019,15 +2782,15 @@
         poseBtns.forEach(function (b) {
           b.setAttribute('aria-current', b === pick.btn ? 'true' : 'false');
         });
-        img.src = sketchSrc(sci, pick.pose);
-      }
+        setMediaImage(img, sketchSrc(sci, pick.pose));
+      } else if (MEDIA_CDN) setMediaImage(img, '');
       // Single-option => hide the chrome.
       if (available.length <= 1) {
         poseToggle.setAttribute('data-unavailable', 'true');
-      }
+      } else poseToggle.removeAttribute('data-unavailable');
       // Slide the white pill to the active button.
       syncPill(poseToggle);
-    });
+    }
     document.getElementById('modalSci').textContent = sci;
     document.getElementById('modalGenus').textContent = (sci.split(' ')[0] || '-');
     document.getElementById('modalCommon').textContent = '-';
@@ -2063,20 +2826,39 @@
       : null;
     modal.setAttribute('aria-hidden', 'false');
     document.body.style.overflow = 'hidden';
-    morphModalOpen(modal.querySelector('.modal-card'), sourceCard);
+    if (!refreshingDetail) morphModalOpen(modal.querySelector('.modal-card'), sourceCard);
 
     // Species detail (lifelist row + every detection).
-    var loadSpecies = SPECIES_CACHE[sci]
-      ? Promise.resolve(SPECIES_CACHE[sci])
-      : fetchJson('./avian/api/birdnet-api.php?action=species&sci=' + encodeURIComponent(sci)).then(function (j) {
-          SPECIES_CACHE[sci] = j;
+    var cachedSpecies = SPECIES_CACHE[sci];
+    if (SNAPSHOT_CDN && cachedSpecies && (!snapshotCurrentIndex || !cachedSpecies.snapshot ||
+        cachedSpecies.snapshot.generation !== snapshotCurrentIndex.generation)) cachedSpecies = null;
+    var loadSpecies = cachedSpecies
+      ? Promise.resolve(cachedSpecies)
+      : fetchJson('./avian/api/birdnet-api.php?action=species&sci=' + encodeURIComponent(sci),
+          { accept: currentDetail }).then(function (j) {
+          if (!SNAPSHOT_CDN || (currentDetail() && snapshotCurrentIndex && j.snapshot &&
+              j.snapshot.generation === snapshotCurrentIndex.generation)) SPECIES_CACHE[sci] = j;
           return j;
         });
     loadSpecies.then(function (j) {
+      if (SNAPSHOT_CDN && !currentDetail()) return;
+      if (document.getElementById('modalSci').textContent !== sci) return;
+      if (PUBLIC_STATIC_MODE && (!snapshotCurrentIndex || !j.snapshot || j.snapshot.generation !== snapshotCurrentIndex.generation)) {
+        document.getElementById('modalRecordings').innerHTML = '<li class="rec-empty">Bird data updated. Reopen this bird to refresh recordings.</li>';
+        return;
+      }
+      if (SNAPSHOT_CDN && j.snapshot.generation !== detailGeneration) {
+        updateDetailPoses(poseBtns.map(function (button) {
+          var pose = +button.dataset.pose;
+          return { pose: pose, btn: button, ok: !!sketchSrc(sci, pose) };
+        }));
+      }
       var s = j.summary || {};
       document.getElementById('modalCommon').textContent = s.com || sci;
       document.getElementById('modalAllTime').textContent = (+s.total || 0).toLocaleString();
-      var winRow = ((DATA.recent && DATA.recent.species) || []).filter(function (x) { return x.sci === sci; })[0];
+      var modalRecent = detailRecent && (!SNAPSHOT_CDN || (j.snapshot && detailRecent.snapshot &&
+        detailRecent.snapshot.generation === j.snapshot.generation)) ? detailRecent : DATA.recent;
+      var winRow = ((modalRecent && modalRecent.species) || []).filter(function (x) { return x.sci === sci; })[0];
       document.getElementById('modalWindow').textContent = (winRow ? +winRow.n : 0).toLocaleString();
       document.getElementById('modalFirstSeen').textContent = s.first_seen ? fmtRecTime(s.first_seen.split(' ')[0], s.first_seen.split(' ')[1]) : '-';
       var rar = rarityLabel(+s.total || 0, s.first_seen);
@@ -2087,40 +2869,49 @@
       document.getElementById('modalRecCount').textContent = dets.length + ' captured';
       document.getElementById('modalRecordings').innerHTML = dets.length
         ? dets.map(function (d) {
-            return '<li class="rec-row" data-file="' + (d.file || '') + '" data-date="' + (d.d || '') + '">'
-              + '<button class="play" type="button" aria-label="play">' + ICON_PLAY + '</button>'
-              + '<span class="when">' + fmtRecTime(d.d, d.t) + '<small>' + fmtDateLine(d.d, d.t) + '</small></span>'
+            var unavailable = PUBLIC_STATIC_MODE && !snapshotMediaSrc(d.media);
+            return '<li class="rec-row" data-file="' + mediaAttr(d.file) + '" data-date="' + mediaAttr(d.d) +
+              '" data-audio="' + mediaAttr(SNAPSHOT_CDN ? snapshotMediaSrc(d.media) : '') + '">'
+              + (unavailable ? '<span aria-hidden="true">—</span>' : '<button class="play" type="button" aria-label="play">' + ICON_PLAY + '</button>')
+              + '<span class="when">' + fmtRecTime(d.d, d.t) + '<small>' + fmtDateLine(d.d, d.t) + '</small>' +
+                (unavailable ? '<small class="rec-unavailable">Recording unavailable</small>' : '') + '</span>'
               + '<span class="conf">' + ((+d.conf || 0) * 100).toFixed(0) + '%</span>'
-              + '<div class="rec-spectro" aria-hidden="true">'
+              + (unavailable ? '' : '<div class="rec-spectro" aria-hidden="true">'
               +   '<div class="rec-spectro-loading">loading spectrogram...</div>'
               +   '<div class="rec-spectro-played"></div>'
               +   '<div class="rec-spectro-cursor"></div>'
               +   '<div class="rec-spectro-scrub" role="slider" aria-label="scrub" tabindex="0"></div>'
-              + '</div>'
+              + '</div>')
               + '</li>';
           }).join('')
         : '<li class="rec-empty">No recordings yet.</li>';
-    }).catch(function () {
-      document.getElementById('modalRecordings').innerHTML = '<li class="rec-empty">Failed to load recordings.</li>';
+    }).catch(function (error) {
+      if (SNAPSHOT_CDN && !currentDetail()) return;
+      var message = error.obsolete ? 'Bird data updated. Reopen this bird to refresh recordings.' :
+        error.retiredMetadata ? 'Bird data is unavailable for this bird.' : 'Failed to load recordings.';
+      document.getElementById('modalRecordings').innerHTML = '<li class="rec-empty">' + message + '</li>';
     });
 
     // Wikipedia summary (description + genus / family).
     var loadWiki = WIKI_CACHE[sci]
       ? Promise.resolve(WIKI_CACHE[sci])
-      : fetchJson('./avian/api/wiki.php?sci=' + encodeURIComponent(sci)).then(function (j) {
+      : (PUBLIC_STATIC_MODE ? loadPublicWiki(sci) : fetchJson('./avian/api/wiki.php?sci=' + encodeURIComponent(sci))).then(function (j) {
           WIKI_CACHE[sci] = j; return j;
         });
     loadWiki.then(function (j) {
+      if (SNAPSHOT_CDN && !currentDetail()) return;
       var desc = document.getElementById('modalDesc');
       desc.textContent = j.extract || 'No description available.';
       desc.classList.toggle('placeholder', !j.extract);
     }).catch(function () {
+      if (SNAPSHOT_CDN && !currentDetail()) return;
       var desc = document.getElementById('modalDesc');
       desc.textContent = 'No description available.';
       desc.classList.add('placeholder');
     });
   }
   function closeDetailModal() {
+    snapshotDetailSequence++;
     var modal = document.getElementById('detail-modal');
     stopModalAudio();
     // Reverse-morph back into the source atlas card so the modal
@@ -2254,7 +3045,9 @@
     var sci = document.getElementById('modalSci').textContent;
     img.classList.add('swapping');
     setTimeout(function () {
-      img.src = sketchSrc(sci, pose);
+      var nextImage = sketchSrc(sci, pose);
+      setMediaImage(img, nextImage);
+      if (!nextImage) { img.classList.remove('swapping'); return; }
       img.addEventListener('load', function once() {
         img.classList.remove('swapping');
         img.removeEventListener('load', once);
@@ -2305,9 +3098,11 @@
   // storage). credentials: 'same-origin' is the default but spelled out
   // for clarity.
   function adminApi(url) {
+    if (PUBLIC_STATIC_MODE) return Promise.reject(new Error('private administration only'));
     return fetch(url, { credentials: 'same-origin', cache: 'no-store' });
   }
   function openAdmin(section) {
+    if (PUBLIC_STATIC_MODE) { renderPublicAdministration(); return; }
     document.body.classList.add('admin-on');
     adminEl.setAttribute('aria-hidden', 'false');
     adminTitle.textContent = ADMIN_TITLES[section] || section;
@@ -2337,6 +3132,7 @@
   }
 
   function renderAdminSettings() {
+    if (PUBLIC_STATIC_MODE) { renderPublicAdministration(); return; }
     adminBody.innerHTML = '<p style="font:11px ui-monospace,monospace;color:var(--ink-soft);text-align:center">loading settings...</p>';
     fetch('./avian/api/config.php', { credentials: 'same-origin', cache: 'no-store' })
       .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
@@ -2866,21 +3662,24 @@
       }
     }
 
-    if (_decodedCache[file]) {
-      paintSpectrogram(canvas, _decodedCache[file]);
+    var url = recordingRowSrc(row);
+    if (!url) { fail('recording unavailable'); return; }
+    var cacheKey = MEDIA_CDN ? url : file;
+    if (_decodedCache[cacheKey]) {
+      paintSpectrogram(canvas, _decodedCache[cacheKey]);
       done();
       return;
     }
     var ctx = getSpecCtx();
     if (!ctx) { fail('WebAudio not available'); return; }
-    fetch('./avian/api/recording.php?file=' + encodeURIComponent(file))
+    fetch(url, MEDIA_CDN ? { redirect: 'error', credentials: 'omit' } : undefined)
       .then(function (r) {
         if (!r.ok) throw new Error('HTTP ' + r.status);
         return r.arrayBuffer();
       })
       .then(function (buf) { return ctx.decodeAudioData(buf); })
       .then(function (audioBuffer) {
-        _decodedCache[file] = audioBuffer;
+        _decodedCache[cacheKey] = audioBuffer;
         paintSpectrogram(canvas, audioBuffer);
         done();
       })
@@ -2914,6 +3713,11 @@
       var prow = playBtn.closest('.rec-row');
       var pfile = prow && prow.dataset.file;
       if (!pfile) return;
+      var playbackUrl = recordingRowSrc(prow);
+      if (!playbackUrl) {
+        playBtn.setAttribute('aria-label', 'recording unavailable');
+        return;
+      }
 
       if (modalRecBtn === playBtn && modalAudio) {
         // Same row's button - toggle pause/resume.
@@ -2938,7 +3742,7 @@
       prow.classList.add('expanded');
       ensureSpectroImage(prow);
       var strip = prow.querySelector('.rec-spectro');
-      var audio = new Audio('./avian/api/recording.php?file=' + encodeURIComponent(pfile));
+      var audio = new Audio(playbackUrl);
       modalAudio = audio;
       audio.addEventListener('loadedmetadata', function () {
         strip.classList.add('armed');
@@ -2969,7 +3773,7 @@
 
     // Row click anywhere else -> toggle strip open/closed.
     var row = ev.target.closest('.rec-row');
-    if (!row) return;
+    if (!row || (PUBLIC_STATIC_MODE && !recordingRowSrc(row))) return;
     var willExpand = !row.classList.contains('expanded');
     if (willExpand) {
       row.classList.add('expanded');

@@ -57,3 +57,14 @@ whitelist_species_list.txt
 avian/assets/references/
 # Superseded assets retained locally
 avian/assets/_legacy/
+
+# Local CDN build output and publisher state; examples and source stay tracked.
+avian/cdn/build/
+avian/cdn/output/
+avian/cdn/state/
+avian/cdn/.env
+avian/cdn/.env.*
+!avian/cdn/.env.example
+avian/cdn/publisher.env
+avian/cdn/publisher.env.*
+!avian/cdn/publisher.env.example

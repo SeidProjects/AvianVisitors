@@ -82,6 +82,8 @@ See [`avian/forwarding/`](avian/forwarding/) for three independent recipes:
 - **Home Assistant REST sensor** that exposes the latest detection.
 - **MQTT bridge** that publishes every new detection.
 
+To serve a static copy of the collage with bird data, recordings and images on an HTTPS CDN, see the [optional CDN configuration and snapshot exporter](avian/cdn/README.md). Normal local installations remain the default; synchronization is configured separately on the publisher host.
+
 ---
 
 ## Repo layout

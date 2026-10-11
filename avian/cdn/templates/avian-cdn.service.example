@@ -1,0 +1,30 @@
+# Example only. Install after setting the user, paths, dependencies and authority.
+[Unit]
+Description=Publish bird recordings and current frontend cache to a CDN
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=birdnet
+Group=birdnet
+EnvironmentFile=/etc/avian-cdn/publisher.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=AWS_EC2_METADATA_DISABLED=true
+ExecStart=/usr/bin/python3 /opt/avian-cdn/run_sync.py --once
+StateDirectory=avian-cdn
+StateDirectoryMode=0700
+UMask=0077
+CPUQuota=50%
+MemoryMax=256M
+LimitAS=512M
+TasksMax=32
+TimeoutStartSec=120
+TimeoutStopSec=5
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/avian-cdn
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
