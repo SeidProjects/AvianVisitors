@@ -80,7 +80,8 @@ failures preserve the pending hint and are harmless to the selected CDN cache.
         request = urllib.request.Request(config.url, data=raw, method='POST',
                                          headers={'Authorization': 'Bearer ' + config.token,
                                                   'Content-Type': 'application/json',
-                                                  'Accept': 'application/json'})
+                                                  'Accept': 'application/json',
+                                                  'User-Agent': 'AvianPublisher/1.0'})
         opener = opener or urllib.request.build_opener(NoRedirect())
         # This is a short optional admission, with no retry or redirect. Each
         # socket operation has a timeout; the caller's process time limit also

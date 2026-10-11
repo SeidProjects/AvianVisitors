@@ -138,6 +138,7 @@ class NotifyTests(unittest.TestCase):
         self.assertEqual((request.full_url, request.get_method(), timeout), (self.config.url, 'POST', 3))
         self.assertEqual(json.loads(request.data), {'generation': index['generation'], 'as_of': index['as_of']})
         self.assertEqual(request.get_header('Authorization'), 'Bearer ' + self.config.token)
+        self.assertEqual(request.get_header('User-agent'), 'AvianPublisher/1.0')
         self.assertEqual(opener.response.read_sizes, [1025])
         self.assertTrue(opener.response.body.closed)
         self.assertEqual(self.delivery()[2], 'delivered')
