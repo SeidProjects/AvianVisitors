@@ -12,6 +12,7 @@
 <script>try{if(localStorage.getItem('bird:theme')==='dark')document.documentElement.setAttribute('data-theme','dark');}catch(e){}</script>
 <link rel="stylesheet" href="./styles.css">
 <link rel="stylesheet" href="./avian/frontend/public-static.css">
+<link rel="stylesheet" href="./avian/frontend/seasonality.css">
 </head>
 <body class="av-local">
 <!-- Pill in the top-left slot, only visible on admin overlays
@@ -120,6 +121,10 @@
       <div class="atlas-grid" id="atlasGrid"></div>
     </section>
 
+    <!-- ========== View 4 - Seasonality ========== -->
+    <section class="view" id="v3" aria-label="Seasonality">
+      <div id="seasonality"></div>
+    </section>
   </div>
 </main>
 
@@ -201,6 +206,7 @@
   <button type="button" data-i="0" aria-current="true">collage</button>
   <button type="button" data-i="1">stats</button>
   <button type="button" data-i="2">atlas</button>
+  <button type="button" data-i="3" id="seasonalityTab" hidden>seasonality</button>
 </nav>
 
 
@@ -217,6 +223,7 @@
 
 <!-- The tracked default keeps local mode. The HTML marker fails closed if config cannot load. -->
 <script src="./avian/frontend/public-config.js"></script>
+<script src="./avian/frontend/seasonality.js"></script>
 <script src="./apt.js"></script>
 </body>
 </html>

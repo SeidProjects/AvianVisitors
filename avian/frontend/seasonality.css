@@ -1,0 +1,57 @@
+/* Optional daily occurrence view, using the app's paper, ink and typography. */
+#seasonalityTab[hidden] { display: none !important; }
+body.seasonality-on .window-pick { visibility: hidden; pointer-events: none; }
+.seasonality-controls { max-width: 1200px; margin: 0 auto 18px; display: flex; flex-wrap: wrap; gap: 14px; align-items: center; justify-content: space-between; }
+.seasonality-toggle { display: inline-flex; padding: 4px; gap: 2px; border-radius: 999px; background: var(--paper-2); box-shadow: var(--recess); }
+.seasonality-control { border: 0; background: transparent; color: var(--ink-soft); border-radius: 999px; padding: 9px 14px; font: 10px/1.2 ui-monospace, Menlo, monospace; letter-spacing: .055em; cursor: pointer; }
+.seasonality-control[aria-pressed="true"] { color: var(--ink); background: var(--pill); box-shadow: var(--raised); }
+.seasonality-control:hover { color: var(--ink); }
+.seasonality-control:focus-visible, .seasonality-inspector input:focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; }
+.seasonality-inspector { display: flex; align-items: center; gap: 5px; color: var(--ink-soft); font: 10px/1.4 ui-monospace, Menlo, monospace; }
+.seasonality-inspector label { margin-right: 4px; }
+.seasonality-inspector input { border: 0; color: var(--ink-2); background: var(--paper-2); box-shadow: var(--recess); border-radius: 7px; padding: 6px 8px; font: 10px/1.4 ui-monospace, Menlo, monospace; }
+.seasonality-inspector .seasonality-control { padding: 7px 10px; background: var(--paper-2); }
+.seasonality-window { max-width: 1200px; margin: 0 auto 8px; color: var(--ink-soft); font: 10px/1.6 ui-monospace, Menlo, monospace; letter-spacing: .035em; }
+.seasonality-caption { max-width: 1200px; margin: 0 auto 10px; color: var(--ink-2); font: italic 15px/1.5 ui-serif, Georgia, serif; }
+.seasonality-coverage { max-width: 1200px; margin: 0 auto 20px; color: var(--ink-soft); font: 10px/1.65 ui-monospace, Menlo, monospace; }
+.seasonality-list { max-width: 1200px; margin: 0 auto; }
+.seasonality-bird { display: grid; grid-template-columns: 154px minmax(0, 1fr); align-items: center; gap: 24px; padding: 22px 0; border-top: 1px solid var(--hairline); }
+.seasonality-bird[hidden] { display: none; }
+.seasonality-portrait { display: flex; align-items: center; justify-content: center; height: 150px; }
+.seasonality-portrait img { display: block; max-width: 100%; max-height: 144px; object-fit: contain; filter: drop-shadow(0 2px 6px rgba(26,22,18,.08)); }
+.seasonality-portrait-empty { max-width: 100px; text-align: center; color: var(--ink-soft); font: italic 12px/1.4 ui-serif, Georgia, serif; }
+.seasonality-bird-content { min-width: 0; }
+.seasonality-bird-heading { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px; }
+.seasonality-bird h3 { margin: 0 0 3px; color: var(--ink); font: 600 20px/1.15 ui-serif, "Iowan Old Style", Georgia, serif; letter-spacing: .01em; }
+.seasonality-scientific { margin: 0; color: var(--ink-soft); font: italic 11px/1.4 ui-serif, Georgia, serif; }
+.seasonality-bird-metric { margin: 0; color: var(--ink-soft); font: 9px/1.5 ui-monospace, Menlo, monospace; }
+.seasonality-day-value { margin: 8px 0 0; min-height: 15px; color: var(--ink-2); font: 9px/1.5 ui-monospace, Menlo, monospace; }
+.seasonality-chart-scroll { min-height: 170px; overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; scrollbar-color: var(--hairline) transparent; }
+.seasonality-chart { width: 100%; min-width: 600px; display: block; overflow: visible; }
+.seasonality-history { fill: var(--paper-2); }
+.seasonality-chart-grid { stroke: var(--hairline); stroke-width: .7; }
+.seasonality-axis-label { fill: var(--ink-soft); font: 9px ui-monospace, Menlo, monospace; }
+.seasonality-count-bar { fill: var(--ink-2); opacity: .25; }
+.seasonality-count-line { stroke: var(--ink-2); stroke-width: 1.15; stroke-linecap: round; }
+.seasonality-count-point { fill: var(--ink-2); }
+.seasonality-partial { opacity: .45; }
+.seasonality-inspect-guide { stroke: var(--ink-soft); stroke-width: .8; stroke-dasharray: 2 4; opacity: .7; }
+.seasonality-empty { max-width: 1200px; margin: 22px auto; color: var(--ink-soft); font: italic 14px/1.6 ui-serif, Georgia, serif; }
+.seasonality-more { margin: 24px 0; background: var(--paper-2); box-shadow: var(--raised); }
+@media (max-width: 1000px) { .seasonality-bird { grid-template-columns: 120px minmax(0, 1fr); gap: 18px; } .seasonality-portrait, .seasonality-portrait img { max-height: 120px; } }
+@media (max-width: 700px) {
+  .seasonality-controls { gap: 10px; margin-bottom: 16px; }
+  .seasonality-control { padding: 8px 11px; font-size: 9px; }
+  .seasonality-inspector { font-size: 9px; }
+  .seasonality-inspector input { font-size: 9px; padding: 5px 7px; }
+  .seasonality-bird { grid-template-columns: 76px minmax(0, 1fr); gap: 12px; align-items: start; padding: 20px 0; }
+  .seasonality-portrait { height: 108px; padding-top: 15px; }
+  .seasonality-portrait img { max-height: 92px; }
+  .seasonality-bird h3 { font-size: 17px; }
+  .seasonality-bird-heading { gap: 6px; }
+  .seasonality-bird-metric { font-size: 8px; }
+  .seasonality-chart-scroll { min-height: 140px; }
+  .seasonality-chart { min-width: 600px; min-height: 140px; }
+  body.seasonality-available .slider button { padding-left: 15px; padding-right: 15px; font-size: 8.5px; letter-spacing: .12em; }
+}
+@media (max-width: 380px) { body.seasonality-available .slider button { padding-left: 11px; padding-right: 11px; font-size: 8px; letter-spacing: .09em; } }

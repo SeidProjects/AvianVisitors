@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 import uuid
 from zoneinfo import ZoneInfo
 
+import seasonality as annual
 from storage_guard import DEFAULT_QUOTA, DEFAULT_RESERVE, output_lock, output_usage, preflight
 
 WINDOWS = (1, 12, 24, 168, 1000000)
@@ -116,7 +117,8 @@ def species_media(media, sci):
             "media_images": public_images}
 
 
-def collect_snapshot(db, instant, timezone, generation, media=None, fix_last_hour=False):
+def collect_snapshot(db, instant, timezone, generation, media=None, fix_last_hour=False,
+                     seasonality=False, guard=None):
     """Caller holds a read transaction. Bind a single clock to all queries.
 
     Queries intentionally match the existing PHP behavior, including future
@@ -127,11 +129,13 @@ def collect_snapshot(db, instant, timezone, generation, media=None, fix_last_hou
     as_of = local.isoformat(timespec="seconds")
     published_at = iso_utc(instant)
     bound = {"now": local_sql}
-    metadata = {"schema_version": 2, "generation": generation,
+    metadata = {"schema_version": 3 if seasonality else 2, "generation": generation,
                 "published_at": published_at, "as_of": as_of,
                 "timezone": timezone.key, "compatibility": {
                     "last_hour": "rolling" if fix_last_hour else "php_today_only"},
                 "media_manifest_generation": media.get("generation") if media else None}
+    if seasonality:
+        metadata["capabilities"] = ["seasonality-v1"]
     results = {}
 
     def store(name, response):
@@ -195,6 +199,8 @@ def collect_snapshot(db, instant, timezone, generation, media=None, fix_last_hou
         sci_paths[sci] = path
         store(path, {"sci": sci, "summary": summaries[sci], "detections": detail_rows[sci],
                      **species_media(media, sci)})
+    if seasonality:
+        store("seasonality", annual.collect_seasonality(db, instant, timezone, guard=guard))
     return results, sci_paths, metadata
 
 
@@ -232,6 +238,8 @@ def hydrate_payload(response, index, action):
     hydrated["snapshot"] = {key: index[key] for key in (
         "schema_version", "generation", "published_at", "as_of", "timezone",
         "compatibility", "media_manifest_generation")}
+    if "capabilities" in index:
+        hydrated["snapshot"]["capabilities"] = list(index["capabilities"])
     return hydrated
 
 
@@ -314,12 +322,17 @@ def _publish_local_unlocked(output, generation, responses, sci_paths, metadata,
             prepared[path] = (raw, True)
             new_lengths.append(len(raw))
     route = lambda key: paths[key]
-    manifest = {**metadata, "routes": {
+    if metadata.get("capabilities") == ["seasonality-v1"] and len(object_metadata) > 512:
+        raise ValueError("complete seasonality cache exceeds object count limit; previous index retained")
+    routes = {
         "stats": route("stats"), "lifelist": route("lifelist"),
         "timeseries": {"30": route("timeseries/30")},
         "firstseen": {"10": route("firstseen/10")},
         "recent": {str(hours): route("recent/" + str(hours)) for hours in WINDOWS},
-        "species": {sci: route(key) for sci, key in sci_paths.items()}},
+        "species": {sci: route(key) for sci, key in sci_paths.items()}}
+    if metadata.get("capabilities") == ["seasonality-v1"]:
+        routes["seasonality"] = route("seasonality")
+    manifest = {**metadata, "routes": routes,
         "objects": object_metadata, "snapshot_count": len(responses),
         "publication": {"data_objects": len(object_metadata),
                         "new_data_objects": len(new_lengths), "new_data_bytes": sum(new_lengths)}}
@@ -359,7 +372,7 @@ def _publish_local_unlocked(output, generation, responses, sci_paths, metadata,
 
 
 def export(db_path, output, *, instant=None, timezone="America/New_York", generation=None,
-           media_manifest=None, media_origin=None, fix_last_hour=False,
+           media_manifest=None, media_origin=None, fix_last_hour=False, seasonality=False,
            max_output_bytes=DEFAULT_QUOTA, min_free_disk_bytes=DEFAULT_RESERVE,
            max_candidate_bytes=32 * 1024 * 1024):
     db_path = Path(db_path).resolve(strict=True)
@@ -383,7 +396,8 @@ def export(db_path, output, *, instant=None, timezone="America/New_York", genera
         columns = {row["name"] for row in db.execute("PRAGMA table_info(detections)")}
         if not REQUIRED_COLUMNS <= columns:
             raise ValueError("database detections schema does not match the reviewed PHP baseline")
-        responses, paths, metadata = collect_snapshot(db, instant, zone, generation, media, fix_last_hour)
+        responses, paths, metadata = collect_snapshot(db, instant, zone, generation, media, fix_last_hour,
+                                                      seasonality=seasonality)
         db.rollback()
     finally:
         db.close()
@@ -405,12 +419,14 @@ def main():
     parser.add_argument("--media-manifest", type=Path)
     parser.add_argument("--media-origin")
     parser.add_argument("--fix-last-hour", action="store_true", help="opt in to a true rolling hour instead of existing PHP midnight behavior")
+    parser.add_argument("--seasonality", action="store_true", help="opt in to complete annual per-bird daily occurrence counts")
     args = parser.parse_args()
     try:
         instant = dt.datetime.fromisoformat(args.as_of.replace("Z", "+00:00")) if args.as_of else None
         manifest = export(args.db, args.output, instant=instant, timezone=args.timezone,
                           generation=args.generation, media_manifest=args.media_manifest,
                           media_origin=args.media_origin, fix_last_hour=args.fix_last_hour,
+                          seasonality=args.seasonality,
                           max_output_bytes=args.max_output_bytes, min_free_disk_bytes=args.min_free_disk_bytes,
                           max_candidate_bytes=args.max_candidate_bytes)
     except (OSError, ValueError, sqlite3.Error) as error:

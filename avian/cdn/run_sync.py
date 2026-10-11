@@ -69,6 +69,7 @@ class FrontendConfig:
     cache_prefix: str = 'data'
     cleanup_current_cache: bool = False
     fix_last_hour: bool = False
+    seasonality: bool = False
 
     @classmethod
     def from_env(cls, environment, sync):
@@ -88,7 +89,8 @@ class FrontendConfig:
             raise ValueError('invalid frontend cache prefix')
         return cls(path, timezone, cache_prefix=prefix,
                    cleanup_current_cache=_boolean(environment, 'CLEANUP_CURRENT_CACHE'),
-                   fix_last_hour=_boolean(environment, 'FIX_LAST_HOUR'), **optional)
+                   fix_last_hour=_boolean(environment, 'FIX_LAST_HOUR'),
+                   seasonality=_boolean(environment, 'SEASONALITY'), **optional)
 
     def cache_config(self, sync):
         return dict(endpoint_url=sync.endpoint_url, bucket=sync.bucket,
@@ -330,7 +332,8 @@ def prepare_frontend(sync, config, ledger, guard, publisher, *, instant=None):
         if not exporter.REQUIRED_COLUMNS <= columns:
             raise ValueError('unsupported detections database schema')
         responses, paths, metadata = exporter.collect_snapshot(db, instant, ZoneInfo(config.timezone),
-                                                              generation, fix_last_hour=config.fix_last_hour)
+                                                              generation, fix_last_hour=config.fix_last_hour,
+                                                              seasonality=config.seasonality, guard=guard)
     finally:
         db.rollback()
         db.close()

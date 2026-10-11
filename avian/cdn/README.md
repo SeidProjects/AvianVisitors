@@ -85,6 +85,16 @@ Cleanup requires the explicit setting; if it is omitted or set to `0`, the publi
 
 For an existing bucket, stop previous publishers and establish exclusive authority before using `--adopt-current-cache`. That one-time command GET-verifies the existing index, matching manifest and every referenced object before adopting only the selected closure. If configured, it separately adopts the current description value. It does not claim unknown old cache objects or import unverified media receipts. Preserve previous state and resolve its uncertain writes before switching publishers; never run two state directories against the same bucket namespace concurrently.
 
+## Optional Seasonality daily series
+
+Set `AVIAN_SYNC_SEASONALITY=1` to publish the schema-3 `seasonality-v1` capability. The browser adds a fourth **Seasonality** tab with a separate daily-occurrence time series for each bird over the last twelve months. Leaving the setting absent or `0` preserves schema 2. Deploy a browser and publisher that both support the capability before enabling it; older strict schema-2 clients cannot adopt a schema-3 index.
+
+The annual window includes the recorder-local current date. Its first date is the day after the date twelve calendar months earlier, clamping a prior February 29 to February 28. Civil-date arithmetic keeps leap days and daylight-saving changes independent of the visitor's timezone. Counts include every valid source observation within the window and captured local time, rather than the species detail view's latest 500 rows. Invalid dates, times, nonexistent spring daylight-saving times and future observations are excluded. Repeated autumn hours preserve their ambiguous local time instead of inventing an offset. The aggregate reports excluded in-window rows and the earliest valid observation; neither detections nor the first observation establish recorder uptime. It identifies unknown coverage and the partial current day. A zero means zero recorded detections, not confirmed absence.
+
+Each species carries sparse `[day_offset, detection_count]` pairs in one compact, content-addressed annual object. The counts include multiple detection rows for the same recording and do not depend on media uploads. The collector reads only dates, local times and bird names, and exports no filenames, confidence or recording identities. The new object belongs to the same verified current graph as the existing application data; it uses the CDN's existing refresh and update signal.
+
+The existing resource allowances remain unchanged: a 4 MiB complete candidate, 8 MiB rolling cache, 2 MiB per JSON object, 512 referenced objects, an 8 MiB allocated temporary tree and a 12 MiB state reservation. The existing 128 MiB shared state allowance, media quotas, SDK request limits, disk reserve and CPU/runtime controls still apply. The annual collector admits at most 200,000 source rows and 500 species. The complete publication must fit its object and byte allowances; exceeding a limit preserves the previously selected graph rather than truncating observations, growing history or requesting data from the recorder. Review a complete export before activating the feature; no provider plan or service is created by enabling it.
+
 ## Scheduling, resources and Cloudflare setup
 
 The default cycle limits are 24 media files, 16 MiB combined media, 8 MiB per file, 1,024 discovery entries, 150 actual SDK transport attempts and 120 seconds. The media phase leaves a request/time margin for the data publisher. Large initial data candidates resume across cycles. A shared body reader limits upload payload release to 512 KiB/s; it does not cap total network bytes. Disk checks require 1.5 GiB free by default, and Linux checks require 512 MiB available memory. These checks complement operating-system CPU, memory and runtime controls. The shared state defaults to a conservative 128 MiB peak allowance including allocated files, SQLite journal growth and spooling; catalog ceilings are 100,000 sources, 10,000 directories and 150,000 immutable keys. Remote media admission reserves every pending or verified immutable key body against an 8 GiB default ceiling. Set `AVIAN_SYNC_REMOTE_RESERVED_BYTES` to a verified baseline for pre-existing untracked content; it is fixed in the target identity and cannot be silently lowered. These are publisher resource limits, not whole-account billing measurements.
@@ -121,6 +131,8 @@ python3 avian/cdn/export_snapshots.py \
 ```
 
 Its optional manifest is schema 1 with `recordings`, `latest_recording` and `images` maps of already verified public identities; it is not an upload receipt. The standalone exporter keeps its own output quota and does not run cloud synchronization or cleanup. `--as-of` and `--generation` support reproducible exports; existing PHP last-hour behavior is preserved unless `--fix-last-hour` is selected.
+
+Add `--seasonality` to an offline export to include the optional annual daily-occurrence capability.
 
 ```sh
 cd avian/cdn

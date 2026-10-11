@@ -106,9 +106,9 @@ def _index(raw, config):
         raise ValueError('cache index exceeds byte limit')
     index = _json(raw)
     if (not isinstance(index, dict) or type(index.get('schema_version')) is not int or
-            index['schema_version'] != 2 or not isinstance(index.get('generation'), str) or
+            index['schema_version'] not in (2, 3) or not isinstance(index.get('generation'), str) or
             not GENERATION.fullmatch(index['generation'])):
-        raise ValueError('invalid schema-2 cache index')
+        raise ValueError('invalid cache index')
     try:
         zone = ZoneInfo(index['timezone'])
         instant = dt.datetime.fromisoformat(index['as_of'].replace('Z', '+00:00'))
@@ -119,9 +119,16 @@ def _index(raw, config):
     except (KeyError, TypeError, AttributeError) as error:
         raise ValueError('missing cache timezone/clock') from error
     objects, routes = index.get('objects'), index.get('routes')
+    actions = {'stats', 'lifelist', 'recent', 'timeseries', 'firstseen', 'species'}
+    if index['schema_version'] == 3:
+        if index.get('capabilities') != ['seasonality-v1']:
+            raise ValueError('unsupported cache capabilities')
+        actions.add('seasonality')
+    elif index.get('capabilities') not in (None, []):
+        raise ValueError('unsupported cache capabilities')
     if (not isinstance(objects, dict) or not 1 <= len(objects) <= config['max_objects'] or
             not isinstance(routes, dict) or
-            set(routes) != {'stats', 'lifelist', 'recent', 'timeseries', 'firstseen', 'species'}):
+            set(routes) != actions):
         raise ValueError('invalid cache object/route inventory')
     for action, keys in (('recent', {'1', '12', '24', '168', '1000000'}),
                          ('timeseries', {'30'}), ('firstseen', {'10'})):
@@ -132,6 +139,8 @@ def _index(raw, config):
     referenced = [routes['stats'], routes['lifelist']]
     for action in ('recent', 'timeseries', 'firstseen', 'species'):
         referenced.extend(routes[action].values())
+    if index['schema_version'] == 3:
+        referenced.append(routes['seasonality'])
     if any(not isinstance(path, str) for path in referenced) or set(referenced) != set(objects):
         raise ValueError('cache routes must reference exactly the captured objects')
     identities, total = {}, 2 * len(raw)

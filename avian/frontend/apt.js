@@ -102,6 +102,7 @@
   var snapshotLoadSequence = 0;
   var snapshotAdoptSequence = 0;
   var snapshotDetailSequence = 0;
+  var seasonalityController = null;
   if (SNAPSHOT_CDN) {
     try {
       var configuredSnapshotUrl = new URL(SNAPSHOT_INDEX_URL);
@@ -118,7 +119,7 @@
     return map && Object.prototype.hasOwnProperty.call(map, key) ? map[key] : null;
   }
   function snapshotNormalizeRequest(request) {
-    if (!request || !['stats', 'lifelist', 'timeseries', 'firstseen', 'recent', 'species'].includes(request.action)) {
+    if (!request || !['stats', 'lifelist', 'timeseries', 'firstseen', 'recent', 'species', 'seasonality'].includes(request.action)) {
       throw new Error('unsupported snapshot action');
     }
     var normalized = { action: request.action };
@@ -205,12 +206,22 @@
     return value;
   }
   function snapshotValidateIndex(index) {
-    if (index.schema_version !== 2 || typeof index.generation !== 'string' || !index.generation ||
+    if (![2, 3].includes(index.schema_version) || typeof index.generation !== 'string' || !index.generation ||
         !Number.isFinite(Date.parse(index.published_at)) || !Number.isFinite(Date.parse(index.as_of)) ||
         typeof index.timezone !== 'string' || !index.timezone || !index.compatibility ||
         !index.routes || typeof index.routes !== 'object' || Array.isArray(index.routes) ||
         !index.objects || typeof index.objects !== 'object' || Array.isArray(index.objects)) {
       throw new Error('invalid snapshot index');
+    }
+    if (index.schema_version === 3) {
+      var actions = ['firstseen', 'lifelist', 'recent', 'seasonality', 'species', 'stats', 'timeseries'];
+      if (!Array.isArray(index.capabilities) || index.capabilities.length !== 1 ||
+          index.capabilities[0] !== 'seasonality-v1' ||
+          JSON.stringify(Object.keys(index.routes).sort()) !== JSON.stringify(actions) ||
+          !window.AvianSeasonality || typeof window.AvianSeasonality.validateIndex !== 'function') {
+        throw new Error('unsupported snapshot capability');
+      }
+      window.AvianSeasonality.validateIndex(index);
     }
     if (snapshotCurrentIndex && index.generation === snapshotCurrentIndex.generation &&
         JSON.stringify(index) !== JSON.stringify(snapshotCurrentIndex)) {
@@ -229,6 +240,11 @@
   }
   function snapshotRoute(index, request) {
     var path = snapshotOwn(index.routes, request.action);
+    if (request.action === 'seasonality') {
+      if (index.schema_version !== 3 || index.capabilities[0] !== 'seasonality-v1') {
+        throw new Error('seasonality is unavailable');
+      }
+    }
     var field = { timeseries: 'days', firstseen: 'limit', recent: 'hours', species: 'sci' }[request.action];
     if (field) path = snapshotOwn(path, request[field]);
     if (typeof path !== 'string' || !/^objects\/[a-f0-9]{64}\.json$/.test(path)) {
@@ -277,10 +293,11 @@
     hydrated.snapshot = {};
     ['schema_version', 'generation', 'published_at', 'as_of', 'timezone', 'compatibility',
       'media_manifest_generation'].forEach(function (key) { hydrated.snapshot[key] = index[key]; });
+    if (index.capabilities) hydrated.snapshot.capabilities = index.capabilities.slice();
     return hydrated;
   }
   // Reject structurally incomplete publisher output before adopting its index.
-  function snapshotValidatePayload(payload, request) {
+  function snapshotValidatePayload(payload, request, index) {
     function object(value) { return value && typeof value === 'object' && !Array.isArray(value); }
     function invalid() { throw new Error('invalid snapshot payload: ' + request.action); }
     function rows(value) {
@@ -296,6 +313,10 @@
       });
     }
     if (!object(payload)) invalid();
+    if (request.action === 'seasonality') {
+      if (!window.AvianSeasonality) invalid();
+      return window.AvianSeasonality.validatePayload(payload, request, index);
+    }
     if (['lifelist', 'firstseen', 'recent'].includes(request.action)) {
       rows(payload.species);
       payload.species.forEach(function (bird) {
@@ -323,7 +344,7 @@
     var references = requests.map(function (request) { return snapshotRoute(index, request); });
     return Promise.all(references.map(snapshotGetObject)).then(function (payloads) {
       return payloads.map(function (payload, i) {
-        snapshotValidatePayload(payload, requests[i]);
+        snapshotValidatePayload(payload, requests[i], index);
         return snapshotHydrate(payload, index, requests[i].action);
       });
     }).catch(function (error) {
@@ -338,7 +359,7 @@
       var reference = snapshotRoute(index, request);
       var cached = snapshotObjectCache.get(reference.path);
       if (!cached || cached.bytes !== reference.bytes) throw new Error('complete cached snapshot unavailable');
-      return snapshotHydrate(snapshotValidatePayload(cached.payload, request), index, request.action);
+      return snapshotHydrate(snapshotValidatePayload(cached.payload, request, index), index, request.action);
     });
   }
   function snapshotPageRequests(hours) {
@@ -480,6 +501,30 @@
     recomputeDerived();
     renderTimeIndependent(animate);
     renderCollageFromData(animate);
+    syncSeasonalityIndex();
+  }
+  function seasonalityAvailable() {
+    return !!(SNAPSHOT_CDN && snapshotCurrentIndex && snapshotCurrentIndex.schema_version === 3 &&
+      snapshotCurrentIndex.capabilities && snapshotCurrentIndex.capabilities[0] === 'seasonality-v1' &&
+      window.AvianSeasonality);
+  }
+  function syncSeasonalityIndex() {
+    var available = seasonalityAvailable();
+    document.body.classList.toggle('seasonality-available', available);
+    var tab = document.getElementById('seasonalityTab');
+    if (tab) tab.hidden = !available;
+    if (seasonalityController) seasonalityController.setIndex(available ? snapshotCurrentIndex : null);
+    if (typeof slider !== 'undefined' && slider) syncPill(slider);
+    if (!available && typeof currentView === 'number' && currentView === 3) go(0);
+  }
+  function loadSeasonalityRoute(index, request) {
+    if (!seasonalityAvailable() || snapshotCurrentIndex.generation !== index.generation) {
+      var error = new Error('obsolete seasonality selection'); error.obsolete = true;
+      return Promise.reject(error);
+    }
+    return loadSnapshots([request], {pinCurrent: true, accept: function () {
+      return snapshotCurrentIndex && snapshotCurrentIndex.generation === index.generation;
+    }}).then(function (parts) { return parts[0]; });
   }
   function loadPublicWiki(sci) {
     var url = publicHttpsUrl(window.AVIAN_WIKI_INDEX_URL);
@@ -597,7 +642,7 @@
   // Each view's title text. The shared static-head shows one of these
   // based on the current view; identical adjacent values mean the title
   // stays put with no fade (collage and stats both say Heard Recently).
-  var VIEW_TITLES = ['Heard Recently', 'Heard Recently', 'Avian Visitors'];
+  var VIEW_TITLES = ['Heard Recently', 'Heard Recently', 'Avian Visitors', 'Seasonality'];
   var staticHead = document.querySelector('.static-head');
   var staticTitle = document.getElementById('staticTitle');
   function setTitleForView(i) {
@@ -626,7 +671,7 @@
   var STATS_LEAD = SLIDE_MS - 200;    // stats - begin a touch sooner
   var currentView = 0;                // collage shows first (no go() needed)
   function go(i) {
-    i = Math.max(0, Math.min(2, i));
+    i = Math.max(0, Math.min(seasonalityAvailable() ? 3 : 2, i));
     // Only a genuine view *switch* replays the entrance. go() also fires when
     // a card is expanded (it sets the #sci= hash, which routes through go(2))
     // while already on the atlas - that must not retrigger the load-in.
@@ -636,6 +681,11 @@
     btns.forEach(function (b, j) { b.setAttribute('aria-current', j === i ? 'true' : 'false'); });
     syncPill(slider);
     setTitleForView(i);
+    document.body.classList.toggle('seasonality-on', i === 3);
+    if (seasonalityController) {
+      if (i === 3) seasonalityController.show();
+      else seasonalityController.hide();
+    }
     if (!switching) return;
     // Replay the view's entrance animation on switch (collage bloom,
     // stats left-to-right, atlas row-by-row).
@@ -1937,6 +1987,15 @@
   // Kick off the initial fetch. Renders pull from DATA as soon as it
   // populates; until then the page sits with empty histograms + lists.
   // animate=true so the collage blooms in on first load.
+  var seasonalityRoot = document.getElementById('seasonality');
+  if (seasonalityRoot && window.AvianSeasonality && typeof window.AvianSeasonality.create === 'function') {
+    seasonalityController = window.AvianSeasonality.create({
+      root: seasonalityRoot,
+      getIndex: function () { return snapshotCurrentIndex; },
+      loadSeasonality: function (index) { return loadSeasonalityRoute(index, {action: 'seasonality'}); },
+      imageUrl: function (sci) { return sketchSrc(sci, 1); }
+    });
+  }
   var publicInitialDataLoad = refreshAll(true);
 
   // Hook into the window picker so the data refetches on change. Pass
