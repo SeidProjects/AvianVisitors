@@ -1,7 +1,30 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createRequire } from 'node:module';
+import fs from 'node:fs';
+import vm from 'node:vm';
 const api = createRequire(import.meta.url)('../frontend/seasonality.js');
+
+test('hidden optional view stays outside tab cycling until the capability enables it', () => {
+  const source = fs.readFileSync(new URL('../frontend/apt.js', import.meta.url), 'utf8');
+  const start = source.indexOf('  function wireToggleAdvance(');
+  const end = source.indexOf('  // ---- Slider ----', start);
+  assert(start >= 0 && end > start);
+  const clicked = [], buttons = [0, 1, 2, 3].map(position => ({
+    hidden: position === 3, disabled: false,
+    getAttribute(name) { return name === 'aria-current' && position === 2 ? 'true' : null; },
+    click() { clicked.push(position); }
+  }));
+  let listener;
+  const container = { querySelectorAll: () => buttons, addEventListener(_name, callback) { listener = callback; } };
+  const context = vm.createContext({ container });
+  vm.runInContext(source.slice(start, end) + '\nwireToggleAdvance(container);', context);
+  listener({ target: { closest: () => null } });
+  assert.deepEqual(clicked, [0]);
+  buttons[3].hidden = false;
+  listener({ target: { closest: () => null } });
+  assert.deepEqual(clicked, [0, 3]);
+});
 
 const path = 'objects/' + 'a'.repeat(64) + '.json';
 function index(generation = 'test1') {

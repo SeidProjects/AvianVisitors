@@ -622,7 +622,7 @@
     container.addEventListener('click', function (ev) {
       if (ev.target.closest('button')) return;   // a specific option was clicked
       var btns = [].slice.call(container.querySelectorAll('button')).filter(function (b) {
-        return !b.disabled && b.getAttribute('data-unavailable') !== 'true';
+        return !b.hidden && !b.disabled && b.getAttribute('data-unavailable') !== 'true';
       });
       if (btns.length < 2) return;
       var cur = -1;
