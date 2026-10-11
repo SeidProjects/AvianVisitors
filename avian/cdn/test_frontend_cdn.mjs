@@ -287,10 +287,22 @@ test('actual modal row playback and waveform use validated embedded URLs without
 test('freshness exposes captured snapshot time, delayed retained/stale data, unavailable state, and hides in origin mode', () => {
   const r = runtime();
   r.context.snapshotCurrentIndex = { timezone: 'America/New_York' };
-  r.context.window.__avianSnapshotStatus = { state: 'fresh', as_of: new Date().toISOString() }; run(r, 'renderSnapshotFreshness()');
-  assert.match(r.element('snapshotFreshness').textContent, /^Updated /); assert.equal(r.element('snapshotFreshness').hidden, false);
+  const now = Date.parse('2026-10-11T15:30:00Z'); r.context.testNow = now; run(r, 'Date.now=function(){return testNow;}');
+  for (const minutes of [0, 10, 15, 20]) {
+    r.context.window.__avianSnapshotStatus = { state: 'fresh', as_of: new Date(now - minutes * 60000).toISOString() };
+    run(r, 'renderSnapshotFreshness()');
+    assert.match(r.element('snapshotFreshness').textContent, /^Updated /, minutes + '-minute healthy publication');
+    assert.equal(r.element('snapshotFreshness').getAttribute('data-state'), 'fresh');
+    assert.equal(r.element('snapshotFreshness').hidden, false);
+  }
+  r.context.window.__avianSnapshotStatus = { state: 'fresh', as_of: new Date(now - 20 * 60000 - 1).toISOString() };
+  run(r, 'renderSnapshotFreshness()');
+  assert.match(r.element('snapshotFreshness').textContent, /^Updates delayed · data from /);
+  assert.equal(r.element('snapshotFreshness').getAttribute('data-state'), 'stale');
+  r.context.window.__avianSnapshotStatus = { state: 'fresh', as_of: new Date(now - 10 * 60000).toISOString() };
   r.context.window.__avianSnapshotStatus.state = 'retained'; run(r, 'renderSnapshotFreshness()');
   assert.match(r.element('snapshotFreshness').textContent, /^Updates delayed · data from /);
+  assert.equal(r.element('snapshotFreshness').getAttribute('data-state'), 'retained');
   r.context.window.__avianSnapshotStatus = { state: 'fresh', as_of: '2020-01-01T00:00:00Z' }; run(r, 'renderSnapshotFreshness()');
   assert.equal(r.element('snapshotFreshness').getAttribute('data-state'), 'stale');
   r.context.window.__avianSnapshotStatus = { state: 'unavailable', as_of: null }; run(r, 'renderSnapshotFreshness()');

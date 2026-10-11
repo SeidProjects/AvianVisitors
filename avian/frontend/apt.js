@@ -511,7 +511,8 @@
       var timestamp;
       try { timestamp = date.toLocaleString(undefined, options); }
       catch (error) { timestamp = date.toLocaleString(); }
-      if (state === 'retained' || Date.now() - date.getTime() > 5 * 60 * 1000) {
+      // Default publication is every 15 minutes; allow five minutes of tolerance.
+      if (state === 'retained' || Date.now() - date.getTime() > 20 * 60 * 1000) {
         state = state === 'retained' ? 'retained' : 'stale';
         text = 'Updates delayed · data from ' + timestamp;
       } else text = 'Updated ' + timestamp;
