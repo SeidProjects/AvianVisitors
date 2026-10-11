@@ -1,0 +1,20 @@
+// Optional example only: no Worker or namespace is created by the sync tool.
+// Supply UPDATES_PUBLISH_TOKEN using a Worker secret, never a public variable.
+// Notify only after the publisher verifies the selected current CDN index.
+// SQLite Durable Objects are supported on Workers Free; its limits can reject
+// requests. Keep the frontend polling fallback and do not enable a paid plan
+// merely to use this optional notification layer.
+{
+  "name": "avian-updates",
+  "main": "../updates_entry.mjs",
+  "compatibility_date": "2026-10-11",
+  "workers_dev": false,
+  "durable_objects": {
+    "bindings": [{"name": "UPDATES", "class_name": "UpdatesHub"}]
+  },
+  "migrations": [{"tag": "v1", "new_sqlite_classes": ["UpdatesHub"]}],
+  "vars": {
+    "UPDATES_ALLOWED_ORIGINS": "[\"https://birds.example\"]",
+    "UPDATES_MAX_CLIENTS": "256"
+  }
+}

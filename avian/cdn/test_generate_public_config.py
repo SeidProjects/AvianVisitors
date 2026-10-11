@@ -78,7 +78,7 @@ class PublicConfigTests(unittest.TestCase):
         for secret in ('unique-secret-value', 'private-access-value', 'token=secret', 'PRIVATE_API_KEY', 'UNKNOWN_PUBLIC_SETTING'):
             self.assertNotIn(secret, body)
         assignments = [line for line in body.splitlines() if line.startswith('window.')]
-        self.assertEqual(len(assignments), 4)
+        self.assertEqual(len(assignments), 5)
         self.assertEqual([line.split(' = ')[0][7:] for line in assignments], list(config.WINDOW_NAMES))
         self.assertIs(json.loads(assignments[0].split(' = ')[1][:-1]), True)
 
@@ -104,6 +104,29 @@ class PublicConfigTests(unittest.TestCase):
             self.assertEqual(output.read_bytes(), body)
             self.assertEqual(output.stat().st_mode & 0o777, 0o644)
             self.assertEqual(list(output.parent.glob('.public-config.js.*')), [])
+
+    def test_optional_updates_url_allows_a_separate_worker_origin(self):
+        result = config.public_config(dict(self.required, AVIAN_UPDATES_URL='wss://updates.example.org/live'))
+        self.assertEqual(result['AVIAN_UPDATES_URL'], 'wss://updates.example.org/live')
+        self.assertEqual(config.public_config(self.required)['AVIAN_UPDATES_URL'], '')
+
+    def test_updates_url_rejects_credentials_queries_fragments_and_parser_ambiguities(self):
+        for value in ('ws://updates.example.org/live', 'https://updates.example.org/live',
+                      'wss://user:secret@updates.example.org/live', 'wss://updates.example.org/live?token=x',
+                      'wss://updates.example.org/live#x', 'wss://updates.example.org/live?',
+                      'wss://updates.example.org/live#', ' wss://updates.example.org/live',
+                      'wss://updates.example.org\\@other.example.org', 'wss://updates.example.org:65536',
+                      'wss://updates.example.org:'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                config.public_config(dict(self.required, AVIAN_UPDATES_URL=value))
+
+    def test_disabled_updates_setting_is_cleared_and_notification_token_never_serializes(self):
+        result = config.public_config(dict(self.required, AVIAN_CDN_ENABLED='0', AVIAN_UPDATES_URL='invalid-secret'))
+        self.assertEqual(result['AVIAN_UPDATES_URL'], '')
+        body = config.render(config.public_config(dict(self.required, AVIAN_UPDATES_URL='wss://updates.example.org/live',
+                            AVIAN_UPDATES_NOTIFY_TOKEN='unique-notification-secret')))
+        self.assertNotIn('unique-notification-secret', body)
+        self.assertNotIn('AVIAN_UPDATES_NOTIFY_TOKEN', body)
 
 
 if __name__ == '__main__':

@@ -33,6 +33,9 @@ function response(raw, ok = true, chunkSize = 97) {
     }, cancel: () => Promise.resolve() }; } },
     arrayBuffer: () => Promise.resolve(buffer(raw)), json: () => Promise.resolve(JSON.parse(raw)) };
 }
+function httpError(status) {
+  return Object.assign(response(Buffer.alloc(0), false), { status });
+}
 const unescape = s => s.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
 const drain = async () => { await new Promise(resolve => setImmediate(resolve)); };
 const settle = async () => { for (let i = 0; i < 10; i++) await drain(); };
@@ -93,7 +96,7 @@ function generation(id = 'g1', count = 1, minute = 0) {
 }
 function runtime(settings = {}, fullScript = false) {
   const first = generation(), state = { index: first.index, objects: first.objects, failures: new Set(), intercept: null };
-  const calls = [], audios = [], timers = [], warnings = [], elements = new Map();
+  const calls = [], audios = [], timers = [], warnings = [], elements = new Map(), documentListeners = {};
   const element = id => elements.has(id) ? elements.get(id) : (elements.set(id, new Element()), elements.get(id));
   const grid = element('atlasGrid');
   Object.defineProperty(grid, 'innerHTML', { get() { return this._html; }, set(value) {
@@ -113,7 +116,8 @@ function runtime(settings = {}, fullScript = false) {
   if (settings.testConfigRequired) documentRoot.setAttribute('data-avian-config-required', '');
   const context = vm.createContext({ window,
     location: { origin: 'https://birds.example.org', href: 'https://birds.example.org/', hash: settings.testHash || '' },
-    URL, AbortController, TextDecoder, Uint8Array, atob, crypto: webcrypto, console: { warn(...v) { warnings.push(v); } },
+    URL, AbortController, TextDecoder, Uint8Array, atob, WebSocket: settings.testWebSocket,
+    crypto: webcrypto, console: { warn(...v) { warnings.push(v); } },
     localStorage: { getItem: () => null, setItem() {} }, performance: { now: () => 0 },
     requestAnimationFrame: () => 1, cancelAnimationFrame() {},
     getComputedStyle: () => ({ getPropertyValue: () => '#efe8d8' }),
@@ -125,7 +129,8 @@ function runtime(settings = {}, fullScript = false) {
       return Promise.resolve(response(raw || Buffer.alloc(0), ok));
     },
     document: { getElementById: element, createElement: () => new Element(), contains: () => true,
-      querySelector: selector => element(selector), querySelectorAll: () => [], addEventListener() {},
+      querySelector: selector => element(selector), querySelectorAll: () => [],
+      addEventListener(name, fn) { (documentListeners[name] ||= []).push(fn); },
       body: new Element(), documentElement: documentRoot, hidden: false },
     DATA: { stats: null, lifelist: null, timeseries: null, firstseen: null, recent: null }, currentHours: 24,
     DIMS: { 'calypte-anna-2': [560, 398], 'calypte-anna': [560, 400] },
@@ -134,7 +139,7 @@ function runtime(settings = {}, fullScript = false) {
     slugify: s => s.toLowerCase().replace(/ /g, '-'), fmtNK: String, fmtN: String, windowLabel: () => 'today',
     wikiUrl: () => 'https://en.wikipedia.org/wiki/Calypte_anna', ebirdUrl: () => 'https://ebird.org/',
     audioClaim() {}, audioRelease() {}, playAtlasEntrance() {}, getSpecCtx: () => null, paintSpectrogram() {},
-    morphModalOpen() {}, syncPill() {}, rarityLabel: () => 'common', fmtRecTime: () => '11:03', fmtDateLine: () => 'today',
+    morphModalOpen() {}, stopModalAudio() {}, syncPill() {}, rarityLabel: () => 'common', fmtRecTime: () => '11:03', fmtDateLine: () => 'today',
     renderTimeIndependent() {}, renderCollageFromData() {}, renderWindowDependent() {}, recomputeDerived() {},
     Audio: class { constructor(url) { this.url = url; this.listeners = {}; audios.push(this); }
       addEventListener(k, f) { this.listeners[k] = f; } pause() {} load() {} removeAttribute() {}
@@ -144,7 +149,7 @@ function runtime(settings = {}, fullScript = false) {
   if (fullScript && !settings.testSuccessfulBoot) state.failures.add(indexUrl);
   if (settings.testConfigScript) vm.runInContext(settings.testConfigScript, context);
   vm.runInContext(fullScript ? draft : helpers, context);
-  return { context, state, calls, audios, timers, warnings, element, grid, p1, p2 };
+  return { context, state, calls, audios, timers, warnings, element, grid, p1, p2, documentListeners };
 }
 const run = (r, code) => vm.runInContext(code, r.context);
 const install = (r, g) => { r.state.index = g.index; for (const [url, raw] of g.objects) r.state.objects.set(url, raw); };
@@ -519,4 +524,318 @@ test('actual tracked default config loads under the required marker and preserve
   assert.equal(r.calls.filter(call => call.url.includes('birdnet-api.php')).length, 5);
   assert(r.calls.some(call => call.url.includes('menu.php')));
   assert.equal(r.element('snapshotFreshness').hidden, true);
+});
+
+test('retired pinned modal metadata refreshes one coherent page and detail batch from the current CDN index', async () => {
+  const r = runtime(); wireRefresh(r); await run(r, 'refreshAll(false)'); wireModal(r);
+  const oldDetail = new URL(r.state.index.routes.species[sci], indexUrl).href;
+  install(r, generation('g2', 2, 1)); r.state.objects.delete(oldDetail);
+  r.state.intercept = url => url === oldDetail ? Promise.resolve(httpError(404)) : null;
+  const before = r.calls.length;
+  run(r, 'openDetailModal("Calypte anna")'); await settle();
+  assert.equal(r.context.snapshotCurrentIndex.generation, 'g2');
+  for (const part of Object.values(r.context.DATA)) assert.equal(part.snapshot.generation, 'g2');
+  assert.equal(r.context.MEDIA.generation, 'media-g2');
+  assert.equal(r.context.SPECIES_CACHE[sci].snapshot.generation, 'g2');
+  assert.equal(r.element('modalAllTime').textContent, '2'); assert.equal(r.element('modalWindow').textContent, '2');
+  assert.equal(r.element('modalImg').src, imageUrl.replace('/g1/', '/g2/'));
+  assert(r.element('modalRecordings').innerHTML.includes('data-audio="' + rowUrl + '"'));
+  assert.equal(r.calls.slice(before).filter(c => c.url === indexUrl).length, 1);
+  assert.equal(r.calls.slice(before).filter(c => c.url === oldDetail).length, 1);
+  assert(r.calls.every(c => c.url.startsWith(base + '/data/')));
+});
+
+test('still-missing current metadata rejects after one 410 recovery without a loop or Pi fallback', async () => {
+  const r = runtime(); wireRefresh(r); await run(r, 'refreshAll(false)');
+  const missing = new URL(r.state.index.routes.species[sci], indexUrl).href, prior = r.context.DATA.stats;
+  r.context.detailRequest = [{ action: 'species', sci }];
+  r.state.intercept = url => url === missing ? Promise.resolve(httpError(410)) : null;
+  const before = r.calls.length;
+  await assert.rejects(run(r, 'loadSnapshots(detailRequest, {pinCurrent:true})'), error => error.status === 410 && error.retiredMetadata);
+  assert.equal(r.calls.slice(before).filter(c => c.url === indexUrl).length, 1);
+  assert.equal(r.calls.slice(before).filter(c => c.url === missing).length, 2);
+  assert.equal(r.context.DATA.stats, prior); assert.equal(r.context.snapshotCurrentIndex.generation, 'g1');
+  assert.equal(r.context.MEDIA.generation, 'media-g1'); assert(r.calls.every(c => c.url.startsWith(base + '/data/')));
+});
+
+test('a newly fetched pointer with a retired object gets one current-index retry before complete adoption', async () => {
+  const r = runtime(); wireRefresh(r); await run(r, 'refreshAll(false)');
+  const next = generation('g2', 2, 1), current = generation('g3', 3, 2); install(r, next);
+  const retired = new URL(next.index.routes.stats, indexUrl).href;
+  r.state.intercept = url => {
+    if (url !== retired) return null;
+    install(r, current); return Promise.resolve(httpError(404));
+  };
+  const before = r.calls.length; await run(r, 'refreshAll(false)');
+  assert.equal(r.calls.slice(before).filter(c => c.url === indexUrl).length, 2);
+  assert.equal(r.calls.slice(before).filter(c => c.url === retired).length, 1);
+  assert(Object.values(r.context.DATA).every(part => part.snapshot.generation === 'g3'));
+  assert.equal(r.context.MEDIA.generation, 'media-g3'); assert.equal(r.context.snapshotCurrentIndex.generation, 'g3');
+  assert(r.calls.every(c => c.url.startsWith(base + '/data/')));
+});
+
+test('obsolete accepted-request token rejects a retired response before refreshing the index', async () => {
+  const r = snapshotRuntime(); await run(r, 'loadSnapshots(requests)');
+  const oldDetail = new URL(r.state.index.routes.species[sci], indexUrl).href; let complete;
+  r.context.detailRequest = [{ action: 'species', sci }]; r.context.acceptDetail = true;
+  r.state.intercept = url => url === oldDetail ? new Promise(resolve => { complete = resolve; }) : null;
+  const before = r.calls.length;
+  const pending = run(r, 'loadSnapshots(detailRequest, {pinCurrent:true,accept:function(){return acceptDetail;}})');
+  await drain(); r.context.acceptDetail = false;
+  const rejected = assert.rejects(pending, error => error.obsolete === true);
+  complete(httpError(404)); await rejected;
+  assert.equal(r.calls.slice(before).filter(c => c.url === indexUrl).length, 0);
+  assert.equal(r.context.snapshotCurrentIndex.generation, 'g1');
+});
+
+test('closing the actual modal during retired-data recovery prevents page, media and detail adoption', async () => {
+  const r = runtime(); wireRefresh(r); await run(r, 'refreshAll(false)'); wireModal(r);
+  vm.runInContext(section('  function closeDetailModal(', '  // Shared-element morph:'), r.context);
+  Object.assign(r.context, { stopModalAudio() {}, morphModalClose(_card, _source, done) { done(); } });
+  const oldDetail = new URL(r.state.index.routes.species[sci], indexUrl).href;
+  const next = generation('g2', 2, 1); install(r, next);
+  const freshDetail = new URL(next.index.routes.species[sci], indexUrl).href; let complete;
+  r.state.intercept = url => url === oldDetail ? Promise.resolve(httpError(404)) :
+    url === freshDetail ? new Promise(resolve => { complete = resolve; }) : null;
+  run(r, 'openDetailModal("Calypte anna")'); await settle(); assert.equal(typeof complete, 'function');
+  run(r, 'closeDetailModal()'); complete(response(r.state.objects.get(freshDetail))); await settle();
+  assert.equal(r.element('detail-modal').getAttribute('aria-hidden'), 'true');
+  assert.equal(r.context.snapshotCurrentIndex.generation, 'g1'); assert.equal(r.context.MEDIA.generation, 'media-g1');
+  assert(Object.values(r.context.DATA).every(part => part.snapshot.generation === 'g1'));
+  assert.equal(r.context.SPECIES_CACHE[sci], undefined);
+});
+
+test('reopening the same bird supersedes its old modal token and permits only the current coherent recovery', async () => {
+  const r = runtime(); wireRefresh(r); await run(r, 'refreshAll(false)'); wireModal(r);
+  const oldDetail = new URL(r.state.index.routes.species[sci], indexUrl).href; let complete;
+  install(r, generation('g2', 2, 1));
+  r.state.intercept = url => url === oldDetail ? new Promise(resolve => { complete = resolve; }) : null;
+  const before = r.calls.length;
+  run(r, 'openDetailModal("Calypte anna")'); await drain();
+  run(r, 'openDetailModal("Calypte anna")'); complete(httpError(404)); await settle();
+  assert.equal(r.calls.slice(before).filter(c => c.url === indexUrl).length, 1);
+  assert.equal(r.context.snapshotCurrentIndex.generation, 'g2'); assert.equal(r.context.SPECIES_CACHE[sci].snapshot.generation, 'g2');
+  assert.equal(r.element('modalAllTime').textContent, '2');
+  assert(!r.element('modalRecordings').innerHTML.includes('Failed to load'));
+});
+
+test('retired recovery still rejects checksum or species-shape failures without adopting or falling back to Pi', async () => {
+  for (const badKind of ['checksum', 'shape']) {
+    const r = runtime(); wireRefresh(r); await run(r, 'refreshAll(false)');
+    const oldDetail = new URL(r.state.index.routes.species[sci], indexUrl).href;
+    const next = generation('g2', 2, 1);
+    if (badKind === 'shape') {
+      const raw = encode({ sci: 'Wrong bird', summary: {}, detections: [] }), hash = createHash('sha256').update(raw).digest('hex');
+      const route = 'objects/' + hash + '.json'; next.index.routes.species[sci] = route;
+      next.index.objects[route] = { sha256: hash, bytes: raw.length }; next.objects.set(new URL(route, indexUrl).href, raw);
+    } else {
+      const target = new URL(next.index.routes.species[sci], indexUrl).href, raw = Buffer.from(next.objects.get(target));
+      raw[1] ^= 1; next.objects.set(target, raw);
+    }
+    install(r, next); r.context.detailRequest = [{ action: 'species', sci }];
+    r.state.intercept = url => url === oldDetail ? Promise.resolve(httpError(404)) : null;
+    const before = r.calls.length;
+    await assert.rejects(run(r, 'loadSnapshots(detailRequest, {pinCurrent:true})'), /checksum mismatch|invalid snapshot payload/);
+    assert.equal(r.calls.slice(before).filter(c => c.url === indexUrl).length, 1);
+    assert.equal(r.context.snapshotCurrentIndex.generation, 'g1'); assert.equal(r.context.MEDIA.generation, 'media-g1');
+    assert(Object.values(r.context.DATA).every(part => part.snapshot.generation === 'g1'));
+    assert(r.calls.every(c => c.url.startsWith(base + '/data/')));
+  }
+});
+
+test('transient current-index failure during retired recovery retains complete cached old page parts', async () => {
+  const r = runtime(); wireRefresh(r); await run(r, 'refreshAll(false)');
+  const next = generation('g2', 2, 1); install(r, next);
+  const retired = new URL(next.index.routes.stats, indexUrl).href; let pointers = 0;
+  r.state.intercept = url => url === retired ? Promise.resolve(httpError(404)) :
+    url === indexUrl && ++pointers === 2 ? Promise.resolve(httpError(503)) : null;
+  await run(r, 'refreshAll(false)');
+  assert.equal(pointers, 2); assert.equal(r.context.snapshotCurrentIndex.generation, 'g1');
+  assert(Object.values(r.context.DATA).every(part => part.snapshot.generation === 'g1'));
+  assert.equal(r.context.MEDIA.generation, 'media-g1'); assert.equal(r.context.window.__avianSnapshotStatus.state, 'retained');
+  assert(r.calls.every(c => c.url.startsWith(base + '/data/')));
+});
+
+test('retired retry cannot overwrite a later adopted generation', async () => {
+  const r = runtime(); wireRefresh(r); await run(r, 'refreshAll(false)');
+  const oldDetail = new URL(r.state.index.routes.species[sci], indexUrl).href;
+  const next = generation('g2', 2, 1); install(r, next);
+  const freshDetail = new URL(next.index.routes.species[sci], indexUrl).href; let complete;
+  r.context.detailRequest = [{ action: 'species', sci }];
+  r.state.intercept = url => url === oldDetail ? Promise.resolve(httpError(404)) :
+    url === freshDetail ? new Promise(resolve => { complete = resolve; }) : null;
+  const pending = run(r, 'loadSnapshots(detailRequest, {pinCurrent:true})'); await settle();
+  assert.equal(typeof complete, 'function'); install(r, generation('g3', 3, 2)); await run(r, 'refreshAll(false)');
+  const rejected = assert.rejects(pending, error => error.obsolete === true);
+  complete(response(r.state.objects.get(freshDetail))); await rejected;
+  assert.equal(r.context.snapshotCurrentIndex.generation, 'g3'); assert.equal(r.context.MEDIA.generation, 'media-g3');
+  assert(Object.values(r.context.DATA).every(part => part.snapshot.generation === 'g3'));
+});
+
+// Synthetic notification transport: no Worker, credential or network required.
+const updatesUrl = 'wss://updates.example.org/live';
+function fakeSockets() {
+  const sockets = [];
+  class Socket {
+    constructor(url) { this.url = url; this.readyState = 0; this.closes = 0; sockets.push(this); }
+    open() { this.readyState = 1; this.onopen?.(); }
+    message(value) { this.onmessage?.({ data: typeof value === 'string' ? value : JSON.stringify(value) }); }
+    close() { this.closes++; this.readyState = 3; this.onclose?.(); }
+    fail() { this.onerror?.(); }
+  }
+  return { Socket, sockets };
+}
+function wireUpdates(r) {
+  vm.runInContext(section('  // Optional update signals.', '  // ---- Menu dropdown ----'), r.context);
+}
+function timer(r, delay) {
+  const selected = r.timers.find(t => !t.cleared && !t.fired && t.delay === delay);
+  assert(selected, 'expected scheduled timer ' + delay); return selected;
+}
+function fire(t) { assert(!t.cleared && !t.fired); t.fired = true; t.fn(); }
+const hint = (generation = 'g2', as_of = '2026-10-11T15:01:00Z') => ({ type: 'updated', generation, as_of });
+function visibility(r, hidden) {
+  r.context.document.hidden = hidden;
+  for (const fn of r.documentListeners.visibilitychange || []) fn();
+}
+
+test('optional updates make no socket without a URL, in local mode, with invalid settings or without browser support', async () => {
+  for (const settings of [{}, { AVIAN_UPDATES_URL: updatesUrl, AVIAN_PUBLIC_STATIC_MODE: false },
+    { AVIAN_UPDATES_URL: 'ws://updates.example.org/live' }, { AVIAN_UPDATES_URL: 'wss://user:secret@updates.example.org/live' },
+    { AVIAN_UPDATES_URL: updatesUrl + '?token=secret' }, { AVIAN_UPDATES_URL: updatesUrl + '#' },
+    { AVIAN_UPDATES_URL: ' wss://updates.example.org/live' },
+    { AVIAN_UPDATES_URL: updatesUrl, AVIAN_MEDIA_ORIGIN: '' }]) {
+    const { Socket, sockets } = fakeSockets(); const r = runtime({ testWebSocket: Socket, ...settings });
+    wireUpdates(r); assert.equal(sockets.length, 0); assert.equal(r.calls.length, 0);
+  }
+  const r = runtime({ AVIAN_UPDATES_URL: updatesUrl }); wireUpdates(r); assert.equal(r.context.updatesSocket, null);
+  const { Socket, sockets } = fakeSockets(); const full = runtime({ testWebSocket: Socket }, true);
+  await settle(); assert.equal(sockets.length, 0); assert.deepEqual(full.calls.map(c => c.url), [indexUrl]);
+});
+
+test('update bursts coalesce into one two-second CDN refresh and never adopt a hinted generation', async () => {
+  const { Socket, sockets } = fakeSockets(); const r = runtime({ AVIAN_UPDATES_URL: updatesUrl, testWebSocket: Socket });
+  run(r, 'updatesRefreshCount=0; refreshAll=function(){updatesRefreshCount++;return Promise.resolve();}'); wireUpdates(r);
+  assert.equal(sockets[0].url, updatesUrl); sockets[0].open();
+  for (let n = 0; n < 20; n++) sockets[0].message(hint('generation-' + n, '2026-10-11T15:01:00Z'));
+  assert.equal(r.timers.filter(t => t.delay === 2000 && !t.cleared && !t.fired).length, 1);
+  fire(timer(r, 2000)); await settle(); assert.equal(r.context.updatesRefreshCount, 1);
+  assert.equal(r.context.snapshotCurrentIndex, null); assert.equal(r.calls.length, 0);
+});
+
+test('stale, unchanged, oversized, malformed and non-aware update hints are ignored', async () => {
+  const { Socket, sockets } = fakeSockets(); const r = runtime({ AVIAN_UPDATES_URL: updatesUrl, testWebSocket: Socket });
+  r.context.snapshotCurrentIndex = generation().index;
+  run(r, 'updatesRefreshCount=0; refreshAll=function(){updatesRefreshCount++;return Promise.resolve();}'); wireUpdates(r);
+  sockets[0].open(); fire(timer(r, 2000)); await settle();
+  for (const value of [hint('g1'), hint('older', '2020-01-01T00:00:00Z'), hint('same-date', '2026-10-11T15:00:00Z'),
+    hint('../unsafe'), hint('g2', '2026-10-11T15:01:00'), hint('g2', 'invalid'),
+    { ...hint(), url: 'https://untrusted.example/object' }, { type: 'unrelated' }, 'not-json', ' '.repeat(1025),
+    { ...hint(), generation: 'é' }, { ...hint(), as_of: [] }]) sockets[0].message(value);
+  sockets[0].onmessage({ data: new Uint8Array(100) });
+  assert.equal(r.context.updatesLastHint, null); assert.equal(r.context.updatesRefreshCount, 1);
+  assert(!r.timers.some(t => t.delay === 2000 && !t.cleared && !t.fired));
+});
+
+test('update hint generations match the publisher format including leading underscore and hyphen', async () => {
+  const { Socket, sockets } = fakeSockets(); const r = runtime({ AVIAN_UPDATES_URL: updatesUrl, testWebSocket: Socket });
+  run(r, 'updatesRefreshCount=0;refreshAll=function(){updatesRefreshCount++;return Promise.resolve();}'); wireUpdates(r);
+  sockets[0].open(); fire(timer(r, 2000)); await settle();
+  for (const value of ['', 'with.dot', 'a'.repeat(81), '../unsafe']) sockets[0].message(hint(value));
+  assert.equal(r.context.updatesLastHint, null); assert.equal(r.context.updatesRefreshCount, 1);
+  for (const value of ['_generation', '-generation', 'a'.repeat(80)]) {
+    sockets[0].message(hint(value)); assert.equal(r.context.updatesLastHint.generation, value);
+  }
+  fire(timer(r, 2000)); await settle(); assert.equal(r.context.updatesRefreshCount, 2);
+  assert.equal(r.context.snapshotCurrentIndex, null); assert.equal(r.calls.length, 0);
+});
+
+test('signal refresh verifies the CDN generation and ignores message generation as publication authority', async () => {
+  const { Socket, sockets } = fakeSockets(); const r = runtime({ AVIAN_UPDATES_URL: updatesUrl, testWebSocket: Socket });
+  wireRefresh(r); await run(r, 'refreshAll(false)'); wireUpdates(r); sockets[0].open();
+  install(r, generation('g2', 2, 1)); sockets[0].message(hint('untrusted-generation', '2026-10-11T16:00:00Z'));
+  fire(timer(r, 2000)); await settle(); assert.equal(r.context.snapshotCurrentIndex.generation, 'g2');
+  assert(Object.values(r.context.DATA).every(part => part.snapshot.generation === 'g2'));
+  assert.equal(r.context.MEDIA.generation, 'media-g2'); assert(r.calls.every(c => c.url.startsWith(base + '/data/')));
+  const bad = generation('g3', 3, 2), url = new URL(bad.index.routes.lifelist, indexUrl).href;
+  const raw = Buffer.from(bad.objects.get(url)); raw[1] ^= 1; bad.objects.set(url, raw); install(r, bad);
+  sockets[0].message(hint('another-hint', '2026-10-11T17:00:00Z')); fire(timer(r, 2000)); await settle();
+  assert.equal(r.context.snapshotCurrentIndex.generation, 'g2'); assert.equal(r.context.MEDIA.generation, 'media-g2');
+  assert.equal(r.context.window.__avianSnapshotStatus.state, 'retained');
+});
+
+test('failed or flapping sockets reconnect with exponential jitter capped at sixty seconds; polling remains usable', async () => {
+  const { Socket, sockets } = fakeSockets(); const r = runtime({ AVIAN_UPDATES_URL: updatesUrl, testWebSocket: Socket });
+  run(r, 'Math.random=function(){return 0.5;}'); wireUpdates(r); const delays = [];
+  for (let n = 0; n < 9; n++) {
+    const socket = sockets.at(-1); socket.open(); socket.fail(); socket.onclose();
+    const retry = r.context.updatesReconnectTimer; delays.push(retry.delay); assert(retry.delay >= 1000 && retry.delay <= 60000);
+    fire(retry); assert.equal(sockets.length, n + 2);
+  }
+  assert.deepEqual(delays, [1125, 2250, 4500, 9000, 18000, 36000, 60000, 60000, 60000]);
+  assert.equal(r.calls.length, 0); wireRefresh(r); await run(r, 'refreshAll(false)');
+  assert.equal(r.context.DATA.stats.totals.detections, 1); assert(r.calls.every(c => c.url.startsWith(base + '/data/')));
+});
+
+test('hidden pages disconnect and cancel retries; visible pages reconnect and refresh the CDN', async () => {
+  const { Socket, sockets } = fakeSockets(); const r = runtime({ AVIAN_UPDATES_URL: updatesUrl, testWebSocket: Socket });
+  run(r, 'updatesRefreshCount=0;refreshAll=function(){updatesRefreshCount++;return Promise.resolve();}'); wireUpdates(r);
+  sockets[0].open(); const queued = timer(r, 2000); visibility(r, true);
+  assert.equal(sockets[0].readyState, 3); assert(queued.cleared); assert.equal(r.context.updatesReconnectTimer, null);
+  assert.equal(r.context.updatesSocket, null); sockets[0].message(hint()); assert.equal(r.context.updatesLastHint, null);
+  visibility(r, false); assert.equal(sockets.length, 2); fire(timer(r, 2000)); await settle();
+  assert.equal(r.context.updatesRefreshCount, 1); assert.equal(r.calls.length, 0);
+});
+
+test('notifications received during a refresh queue one further refresh without parallel work', async () => {
+  const { Socket, sockets } = fakeSockets(); const r = runtime({ AVIAN_UPDATES_URL: updatesUrl, testWebSocket: Socket });
+  run(r, 'updatesRefreshCount=0;refreshAll=function(){updatesRefreshCount++;return new Promise(function(resolve){finishUpdates=resolve;});}');
+  wireUpdates(r); sockets[0].open(); fire(timer(r, 2000)); await settle();
+  for (let n = 0; n < 10; n++) sockets[0].message(hint('new-' + n));
+  assert.equal(r.context.updatesRefreshCount, 1); assert.equal(r.context.updatesRefreshTimer, null);
+  run(r, 'finishUpdates()'); await settle(); fire(timer(r, 2000)); await settle();
+  assert.equal(r.context.updatesRefreshCount, 2); run(r, 'finishUpdates()'); await settle();
+});
+
+test('signal refresh reloads an open modal coherently without repeating its entrance animation', async () => {
+  const { Socket, sockets } = fakeSockets(); const r = runtime({ AVIAN_UPDATES_URL: updatesUrl, testWebSocket: Socket });
+  wireRefresh(r); await run(r, 'refreshAll(false)'); wireModal(r);
+  run(r, 'modalEntrances=0;audioStops=0;morphModalOpen=function(){modalEntrances++;};stopModalAudio=function(){audioStops++;};openDetailModal("Calypte anna")');
+  await settle(); wireUpdates(r); sockets[0].open(); install(r, generation('g2', 2, 1));
+  sockets[0].message(hint()); fire(timer(r, 2000)); await settle();
+  assert.equal(r.context.modalEntrances, 1); assert.equal(r.context.audioStops, 1);
+  assert.equal(r.element('modalAllTime').textContent, '2'); assert.equal(r.element('modalWindow').textContent, '2');
+  assert.equal(r.context.SPECIES_CACHE[sci].snapshot.generation, 'g2');
+  assert.equal(r.element('modalImg').src, imageUrl.replace('/g1/', '/g2/'));
+  assert(r.calls.every(c => c.url.startsWith(base + '/data/')));
+});
+
+test('closing a modal while a signal refresh is pending never reopens or writes that closed modal', async () => {
+  const { Socket, sockets } = fakeSockets(); const r = runtime({ AVIAN_UPDATES_URL: updatesUrl, testWebSocket: Socket });
+  wireRefresh(r); await run(r, 'refreshAll(false)'); wireModal(r);
+  vm.runInContext(section('  function closeDetailModal(', '  // Shared-element morph:'), r.context);
+  r.context.morphModalClose = (_card, _source, done) => done();
+  run(r, 'openDetailModal("Calypte anna")'); await settle(); wireUpdates(r); sockets[0].open();
+  const next = generation('g2', 2, 1); install(r, next);
+  const slow = new URL(next.index.routes.lifelist, indexUrl).href; let complete;
+  r.state.intercept = url => url === slow ? new Promise(resolve => { complete = resolve; }) : null;
+  fire(timer(r, 2000)); await settle(); run(r, 'closeDetailModal()');
+  complete(response(r.state.objects.get(slow))); await settle();
+  assert.equal(r.context.snapshotCurrentIndex.generation, 'g2');
+  assert.equal(r.element('detail-modal').getAttribute('aria-hidden'), 'true');
+  assert.equal(r.element('modalAllTime').textContent, '1'); assert.equal(r.context.SPECIES_CACHE[sci], undefined);
+});
+
+test('socket construction and connection deadlines back off once; obsolete callbacks cannot schedule extra work', () => {
+  class Unavailable { constructor() { throw new Error('synthetic transport unavailable'); } }
+  const absent = runtime({ AVIAN_UPDATES_URL: updatesUrl, testWebSocket: Unavailable });
+  run(absent, 'Math.random=function(){return 0;}'); wireUpdates(absent);
+  assert.equal(absent.context.updatesReconnectTimer.delay, 1000); assert.equal(absent.calls.length, 0);
+  const { Socket, sockets } = fakeSockets(); const r = runtime({ AVIAN_UPDATES_URL: updatesUrl, testWebSocket: Socket });
+  run(r, 'Math.random=function(){return 0;}'); wireUpdates(r); const old = sockets[0];
+  fire(timer(r, 10000)); const retry = r.context.updatesReconnectTimer;
+  assert.equal(old.readyState, 3); assert.equal(retry.delay, 1000);
+  old.open(); old.message(hint()); old.onclose(); assert.equal(r.context.updatesReconnectTimer, retry);
+  assert.equal(r.context.updatesRefreshTimer, null); fire(retry); sockets[1].open();
+  fire(timer(r, 30000)); assert.equal(r.context.updatesReconnectAttempt, 0);
 });

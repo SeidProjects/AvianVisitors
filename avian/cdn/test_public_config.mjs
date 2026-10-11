@@ -9,7 +9,7 @@ import test from 'node:test';
 
 const generator = join(dirname(fileURLToPath(import.meta.url)), 'generate_public_config.py');
 const names = ['AVIAN_PUBLIC_STATIC_MODE', 'AVIAN_MEDIA_ORIGIN',
-  'AVIAN_SNAPSHOT_INDEX_URL', 'AVIAN_WIKI_INDEX_URL'];
+  'AVIAN_SNAPSHOT_INDEX_URL', 'AVIAN_WIKI_INDEX_URL', 'AVIAN_UPDATES_URL'];
 const python = process.env.PYTHON || 'python3';
 
 function generated(environment, inspect, previous = '') {
@@ -68,11 +68,31 @@ test('complete public URLs auto-enable and use equal browser origins', () => {
     const window = evaluate(source);
     assert.equal(window.AVIAN_PUBLIC_STATIC_MODE, true);
     assert.equal(window.AVIAN_MEDIA_ORIGIN, 'https://media.example.net');
-    for (const name of names.slice(2)) {
+    for (const name of ['AVIAN_SNAPSHOT_INDEX_URL', 'AVIAN_WIKI_INDEX_URL']) {
       assert.equal(new URL(window[name]).origin, window.AVIAN_MEDIA_ORIGIN);
     }
     assert.notEqual(new URL('https://birds.example.org').origin, window.AVIAN_MEDIA_ORIGIN);
   });
+});
+
+test('optional WSS Worker URL executes as a fifth public setting without notification credentials', () => {
+  generated({ AVIAN_MEDIA_ORIGIN: 'https://media.example.net',
+    AVIAN_SNAPSHOT_INDEX_URL: 'https://media.example.net/data/snapshot-index.json',
+    AVIAN_UPDATES_URL: 'wss://updates.example.org/live', AVIAN_UPDATES_NOTIFY_TOKEN: 'synthetic-notify-secret' },
+  (result, read) => {
+    assert.equal(result.status, 0); assert(!read().includes('synthetic-notify-secret'));
+    const window = evaluate(read()); assert.equal(window.AVIAN_UPDATES_URL, 'wss://updates.example.org/live');
+    assert.notEqual(new URL(window.AVIAN_UPDATES_URL).hostname, new URL(window.AVIAN_MEDIA_ORIGIN).hostname);
+  });
+});
+
+test('unsafe WSS configuration fails before replacing the previous artifact', () => {
+  generated({ AVIAN_MEDIA_ORIGIN: 'https://media.example.net',
+    AVIAN_SNAPSHOT_INDEX_URL: 'https://media.example.net/data/snapshot-index.json',
+    AVIAN_UPDATES_URL: 'wss://user:synthetic-secret@updates.example.org/live' }, (result, read) => {
+    assert.equal(result.status, 2); assert(!result.stderr.includes('synthetic-secret'));
+    assert.equal(read(), 'previous-release-bytes');
+  }, 'previous-release-bytes');
 });
 
 test('partial configuration exits unsuccessfully and preserves prior browser artifact', () => {

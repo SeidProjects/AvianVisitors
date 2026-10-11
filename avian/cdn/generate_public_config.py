@@ -10,7 +10,7 @@ import tempfile
 from urllib.parse import urlsplit
 
 
-URL_NAMES = ('AVIAN_MEDIA_ORIGIN', 'AVIAN_SNAPSHOT_INDEX_URL', 'AVIAN_WIKI_INDEX_URL')
+URL_NAMES = ('AVIAN_MEDIA_ORIGIN', 'AVIAN_SNAPSHOT_INDEX_URL', 'AVIAN_WIKI_INDEX_URL', 'AVIAN_UPDATES_URL')
 WINDOW_NAMES = ('AVIAN_PUBLIC_STATIC_MODE',) + URL_NAMES
 
 
@@ -67,8 +67,24 @@ def public_config(environment):
         wiki, wiki_origin = https_url(values['AVIAN_WIKI_INDEX_URL'], 'AVIAN_WIKI_INDEX_URL')
         if wiki_origin != origin:
             raise ValueError('AVIAN_WIKI_INDEX_URL must use AVIAN_MEDIA_ORIGIN')
+    updates = ''
+    if values['AVIAN_UPDATES_URL']:
+        updates = wss_url(values['AVIAN_UPDATES_URL'])
     return dict(AVIAN_PUBLIC_STATIC_MODE=True, AVIAN_MEDIA_ORIGIN=media,
-                AVIAN_SNAPSHOT_INDEX_URL=snapshot, AVIAN_WIKI_INDEX_URL=wiki)
+                AVIAN_SNAPSHOT_INDEX_URL=snapshot, AVIAN_WIKI_INDEX_URL=wiki,
+                AVIAN_UPDATES_URL=updates)
+
+
+def wss_url(value):
+    label = 'AVIAN_UPDATES_URL'
+    if not isinstance(value, str) or not value.lower().startswith('wss://') or '?' in value or '#' in value:
+        raise ValueError(label + ' must be a clean WSS URL without credentials, query or fragment')
+    try:
+        # Apply the same host/port/parser checks; a Worker may use another origin.
+        https_url('https://' + value[6:], label)
+    except ValueError as error:
+        raise ValueError(str(error).replace('HTTPS', 'WSS')) from None
+    return value
 
 
 def render(config):

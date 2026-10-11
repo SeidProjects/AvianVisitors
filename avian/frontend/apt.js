@@ -101,6 +101,7 @@
   var snapshotObjectPending = new Map();
   var snapshotLoadSequence = 0;
   var snapshotAdoptSequence = 0;
+  var snapshotDetailSequence = 0;
   if (SNAPSHOT_CDN) {
     try {
       var configuredSnapshotUrl = new URL(SNAPSHOT_INDEX_URL);
@@ -152,7 +153,11 @@
       cache: cache, redirect: 'error', credentials: 'omit',
       signal: controller ? controller.signal : undefined
     }).then(function (response) {
-      if (!response.ok) throw new Error('snapshot HTTP ' + response.status);
+      if (!response.ok) {
+        var error = new Error('snapshot HTTP ' + response.status);
+        error.status = response.status;
+        throw error;
+      }
       var length = response.headers && response.headers.get('Content-Length');
       if (length && (!/^\d+$/.test(length) || +length > maxBytes)) {
         if (controller) controller.abort();
@@ -321,7 +326,25 @@
         snapshotValidatePayload(payload, requests[i]);
         return snapshotHydrate(payload, index, requests[i].action);
       });
+    }).catch(function (error) {
+      if (error.status === 404 || error.status === 410) error.retiredMetadata = true;
+      throw error;
     });
+  }
+  function snapshotReadCachedBatch(index, requests) {
+    // Retention uses only complete, already verified browser objects. Old
+    // objects may have been removed from the current-only CDN dataset.
+    return requests.map(function (request) {
+      var reference = snapshotRoute(index, request);
+      var cached = snapshotObjectCache.get(reference.path);
+      if (!cached || cached.bytes !== reference.bytes) throw new Error('complete cached snapshot unavailable');
+      return snapshotHydrate(snapshotValidatePayload(cached.payload, request), index, request.action);
+    });
+  }
+  function snapshotPageRequests(hours) {
+    return [{ action: 'stats' }, { action: 'lifelist' },
+      { action: 'timeseries', days: 30 }, { action: 'firstseen', limit: 10 },
+      { action: 'recent', hours: hours }];
   }
   function snapshotSetStatus(state, index, error) {
     window.__avianSnapshotStatus = {
@@ -336,40 +359,68 @@
     try { requests = requests.map(snapshotNormalizeRequest); }
     catch (error) { return Promise.reject(error); }
     if (!SNAPSHOT_CDN) return Promise.reject(new Error('snapshot mode not enabled'));
-    if (options.pinCurrent) {
-      if (!snapshotCurrentIndex) return Promise.reject(new Error('snapshot generation not ready'));
-      try { return snapshotReadBatch(snapshotCurrentIndex, requests); }
-      catch (error) { return Promise.reject(error); }
-    }
+    if (options.pinCurrent && !snapshotCurrentIndex) return Promise.reject(new Error('snapshot generation not ready'));
     var sequence = ++snapshotLoadSequence;
+    var recoveryAttempted = false, recoveryHours = null;
     function ensureCurrentRequest() {
-      if (sequence < snapshotAdoptSequence || (options.accept && !options.accept())) {
+      if (sequence < snapshotAdoptSequence || (options.accept && !options.accept()) ||
+          (recoveryHours !== null && recoveryHours !== currentHours)) {
         var error = new Error('obsolete snapshot refresh'); error.obsolete = true; throw error;
       }
     }
-    return snapshotFetchIndex().then(function (index) {
+    function checkIndex(index) {
+      ensureCurrentRequest();
+      snapshotValidateIndex(index);
       if (snapshotCurrentIndex && Date.parse(index.published_at) < Date.parse(snapshotCurrentIndex.published_at)) {
         throw new Error('older snapshot pointer received');
       }
-      return snapshotReadBatch(index, requests).then(function (parts) {
+      return index;
+    }
+    function read(index, batch) {
+      try { return snapshotReadBatch(index, batch); }
+      catch (error) { return Promise.reject(error); }
+    }
+    function readRequested(index) {
+      return read(index, requests).then(function (parts) {
+        return { index: index, parts: parts };
+      }).catch(function (error) {
         ensureCurrentRequest();
-        if (snapshotCurrentIndex && snapshotCurrentIndex.generation !== index.generation &&
-            typeof SPECIES_CACHE === 'object') SPECIES_CACHE = {};
-        snapshotCurrentIndex = index;
-        snapshotAdoptSequence = sequence;
-        snapshotSetStatus('fresh', index);
-        return parts;
+        if (!error.retiredMetadata || recoveryAttempted) throw error;
+        recoveryAttempted = true;
+        recoveryHours = currentHours;
+        // A retired pinned detail needs the displayed page and requested
+        // routes from the same fresh index. This path retries exactly once.
+        return snapshotFetchIndex().then(checkIndex).then(function (current) {
+          return read(current, snapshotPageRequests(recoveryHours).map(snapshotNormalizeRequest).concat(requests))
+            .then(function (parts) {
+              return { index: current, parts: parts.slice(5), pageParts: parts.slice(0, 5) };
+            });
+        });
       });
+    }
+    try { ensureCurrentRequest(); }
+    catch (error) { return Promise.reject(error); }
+    var initial = options.pinCurrent ? Promise.resolve(snapshotCurrentIndex) : snapshotFetchIndex().then(checkIndex);
+    return initial.then(readRequested).then(function (result) {
+      ensureCurrentRequest();
+      if (!options.pinCurrent || result.pageParts) {
+        checkIndex(result.index);
+        if (snapshotCurrentIndex && snapshotCurrentIndex.generation !== result.index.generation &&
+            typeof SPECIES_CACHE === 'object') SPECIES_CACHE = {};
+        snapshotCurrentIndex = result.index;
+        snapshotAdoptSequence = sequence;
+        if (result.pageParts) installSnapshotPage(result.pageParts, false, recoveryHours);
+        snapshotSetStatus('fresh', result.index);
+      }
+      return result.parts;
     }).catch(function (error) {
       if (error.obsolete) throw error;
       ensureCurrentRequest();
       if (!snapshotCurrentIndex) { snapshotSetStatus('unavailable', null, error); throw error; }
       var retainedIndex = snapshotCurrentIndex;
-      return snapshotReadBatch(retainedIndex, requests).then(function (parts) {
-        ensureCurrentRequest();
-        snapshotSetStatus('retained', retainedIndex, error);
-        return parts;
-      });
+      snapshotSetStatus('retained', retainedIndex, error);
+      try { return snapshotReadCachedBatch(retainedIndex, requests); }
+      catch (unavailable) { throw error; }
     });
   }
 
@@ -418,6 +469,17 @@
     // generation therefore retains its matching media references too.
     MEDIA = next;
     mediaManifestLoaded = true;
+  }
+  function installSnapshotPage(parts, animate, forHours) {
+    installPublicMedia(parts);
+    DATA.stats = parts[0];
+    DATA.lifelist = parts[1];
+    DATA.timeseries = parts[2];
+    DATA.firstseen = parts[3];
+    if (forHours === currentHours && parts[4]) DATA.recent = parts[4];
+    recomputeDerived();
+    renderTimeIndependent(animate);
+    renderCollageFromData(animate);
   }
   function loadPublicWiki(sci) {
     var url = publicHttpsUrl(window.AVIAN_WIKI_INDEX_URL);
@@ -1325,13 +1387,14 @@
   // Map sci -> all-time detection count, populated from lifelist for atlas.
   var speciesTotals = {};
 
-  function fetchJson(url) {
+  function fetchJson(url, options) {
     if (SNAPSHOT_CDN) {
       try {
         var requestedUrl = new URL(url, location.href);
         if (requestedUrl.pathname.endsWith('/avian/api/birdnet-api.php')) {
           var request = snapshotRequestFromUrl(requestedUrl);
-          return loadSnapshots([request], { pinCurrent: true }).then(function (parts) { return parts[0]; });
+          return loadSnapshots([request], { pinCurrent: true, accept: options && options.accept })
+            .then(function (parts) { return parts[0]; });
         }
       } catch (error) { return Promise.reject(error); }
     }
@@ -1854,11 +1917,7 @@
   function refreshAll(animate) {
     var forHours = currentHours;
     var metadata = SNAPSHOT_CDN ? refreshMediaManifest().then(function () {
-      return loadSnapshots([
-      { action: 'stats' }, { action: 'lifelist' },
-      { action: 'timeseries', days: 30 }, { action: 'firstseen', limit: 10 },
-      { action: 'recent', hours: forHours }
-      ], { accept: function () { return forHours === currentHours; } });
+      return loadSnapshots(snapshotPageRequests(forHours), { accept: function () { return forHours === currentHours; } });
     }) : Promise.all([
       fetchJson('./avian/api/birdnet-api.php?action=stats').catch(function () { return null; }),
       fetchJson('./avian/api/birdnet-api.php?action=lifelist').catch(function () { return null; }),
@@ -1867,18 +1926,7 @@
       fetchJson('./avian/api/birdnet-api.php?action=recent&hours=' + forHours).catch(function () { return null; }),
     ]);
     return Promise.all([refreshMediaManifest(), metadata]).then(function (results) {
-      var parts = results[1];
-      installPublicMedia(parts);
-      DATA.stats = parts[0];
-      DATA.lifelist = parts[1];
-      DATA.timeseries = parts[2];
-      DATA.firstseen = parts[3];
-      // Only accept the recent slice if the window hasn't changed
-      // since this poll started - otherwise keep what's there.
-      if (forHours === currentHours && parts[4]) DATA.recent = parts[4];
-      recomputeDerived();
-      renderTimeIndependent(animate);
-      renderCollageFromData(animate);
+      installSnapshotPage(results[1], animate, forHours);
     }).catch(function (error) {
       // In snapshot mode preserve the last complete DATA set.
       if (!error.obsolete) console.warn('BirdNET snapshot refresh unavailable', error);
@@ -1923,6 +1971,122 @@
     }
   });
   startPolling();
+
+  // Optional update signals. The verified CDN index remains authoritative.
+  var updatesUrl = '', updatesSocket = null, updatesReconnectTimer = null;
+  var updatesConnectTimer = null, updatesStableTimer = null, updatesRefreshTimer = null;
+  var updatesReconnectAttempt = 0, updatesRefreshing = false, updatesRefreshQueued = false;
+  var updatesLastHint = null;
+  if (PUBLIC_STATIC_MODE && snapshotOrigin && typeof WebSocket === 'function') {
+    try {
+      var configuredUpdatesUrl = window.AVIAN_UPDATES_URL;
+      if (typeof configuredUpdatesUrl === 'string' && configuredUpdatesUrl &&
+          configuredUpdatesUrl === configuredUpdatesUrl.trim() &&
+          !/[\x00-\x20\x7f\\?#]/.test(configuredUpdatesUrl)) {
+        var parsedUpdatesUrl = new URL(configuredUpdatesUrl);
+        if (parsedUpdatesUrl.protocol === 'wss:' && !parsedUpdatesUrl.username && !parsedUpdatesUrl.password) {
+          updatesUrl = parsedUpdatesUrl.href;
+        }
+      }
+    } catch (error) { /* Polling continues when optional configuration is invalid. */ }
+  }
+  function updatesHint(data) {
+    // The three wire fields are ASCII, so this also caps UTF-8 bytes at 1 KiB.
+    if (typeof data !== 'string' || data.length > 1024 || /[^\x00-\x7f]/.test(data)) return null;
+    try {
+      var hint = JSON.parse(data);
+      if (!hint || Array.isArray(hint) || Object.keys(hint).sort().join(',') !== 'as_of,generation,type' ||
+          hint.type !== 'updated' || typeof hint.generation !== 'string' ||
+          !/^[A-Za-z0-9_-]{1,80}$/.test(hint.generation) || typeof hint.as_of !== 'string' ||
+          !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/.test(hint.as_of) ||
+          !Number.isFinite(Date.parse(hint.as_of))) return null;
+      if (snapshotCurrentIndex && (hint.generation === snapshotCurrentIndex.generation ||
+          Date.parse(hint.as_of) <= Date.parse(snapshotCurrentIndex.as_of))) return null;
+      if (updatesLastHint && (hint.generation === updatesLastHint.generation ||
+          Date.parse(hint.as_of) < Date.parse(updatesLastHint.as_of))) return null;
+      return hint;
+    } catch (error) { return null; }
+  }
+  function queueUpdatesRefresh() {
+    if (!updatesUrl || document.hidden) return;
+    updatesRefreshQueued = true;
+    if (updatesRefreshing || updatesRefreshTimer) return;
+    updatesRefreshTimer = setTimeout(function () {
+      updatesRefreshTimer = null;
+      if (document.hidden || !updatesRefreshQueued) return;
+      updatesRefreshQueued = false; updatesRefreshing = true;
+      var before = snapshotCurrentIndex && snapshotCurrentIndex.generation;
+      var modal = document.getElementById('detail-modal');
+      var sci = modal.getAttribute('aria-hidden') === 'false' ? document.getElementById('modalSci').textContent : '';
+      var detailSequence = snapshotDetailSequence;
+      Promise.resolve().then(function () { return refreshAll(false); }).then(function () {
+        if (sci && !document.hidden && detailSequence === snapshotDetailSequence &&
+            modal.getAttribute('aria-hidden') === 'false' && document.getElementById('modalSci').textContent === sci &&
+            snapshotCurrentIndex && snapshotCurrentIndex.generation !== before) {
+          openDetailModal(sci, { refresh: true });
+        }
+      }).catch(function () { /* CDN refresh/polling owns the retained-data state. */ }).then(function () {
+        updatesRefreshing = false;
+        if (updatesRefreshQueued) queueUpdatesRefresh();
+      });
+    }, 2000);
+  }
+  function scheduleUpdatesReconnect() {
+    if (!updatesUrl || document.hidden || updatesReconnectTimer) return;
+    var base = Math.min(60000, 1000 * Math.pow(2, Math.min(updatesReconnectAttempt++, 6)));
+    var delay = Math.min(60000, Math.round(base * (1 + Math.random() * 0.25)));
+    updatesReconnectTimer = setTimeout(function () {
+      updatesReconnectTimer = null; startUpdates();
+    }, delay);
+  }
+  function clearUpdatesConnectionTimers() {
+    clearTimeout(updatesConnectTimer); clearTimeout(updatesStableTimer);
+    updatesConnectTimer = updatesStableTimer = null;
+  }
+  function startUpdates() {
+    if (!updatesUrl || document.hidden || updatesSocket || updatesReconnectTimer) return;
+    var socket;
+    try { socket = new WebSocket(updatesUrl); }
+    catch (error) { scheduleUpdatesReconnect(); return; }
+    updatesSocket = socket;
+    function failed() {
+      if (updatesSocket !== socket) return;
+      updatesSocket = null; clearUpdatesConnectionTimers();
+      try { socket.close(); } catch (error) { /* Already closed. */ }
+      scheduleUpdatesReconnect();
+    }
+    updatesConnectTimer = setTimeout(failed, 10000);
+    socket.onopen = function () {
+      if (updatesSocket !== socket) return;
+      clearTimeout(updatesConnectTimer); updatesConnectTimer = null;
+      // A flapping connection must not reset its backoff on every open.
+      updatesStableTimer = setTimeout(function () {
+        if (updatesSocket === socket) updatesReconnectAttempt = 0;
+      }, 30000);
+      queueUpdatesRefresh(); // Recover missed hints through the CDN.
+    };
+    socket.onmessage = function (event) {
+      if (updatesSocket !== socket || document.hidden) return;
+      var hint = updatesHint(event.data);
+      if (!hint) return;
+      updatesLastHint = hint; queueUpdatesRefresh();
+    };
+    socket.onerror = socket.onclose = failed;
+  }
+  function stopUpdates() {
+    clearTimeout(updatesReconnectTimer); clearTimeout(updatesRefreshTimer);
+    updatesReconnectTimer = updatesRefreshTimer = null; updatesRefreshQueued = false;
+    clearUpdatesConnectionTimers();
+    var socket = updatesSocket; updatesSocket = null;
+    if (socket) { try { socket.close(); } catch (error) { /* Already closed. */ } }
+  }
+  if (updatesUrl) {
+    document.addEventListener('visibilitychange', function () {
+      if (document.hidden) stopUpdates();
+      else { startUpdates(); queueUpdatesRefresh(); }
+    });
+    startUpdates();
+  }
 
   // ---- Menu dropdown ----
   var dd = document.getElementById('menu-dd');
@@ -2489,8 +2653,9 @@
     var com = sp ? (sp.com || '') : '';
     return birdImageSrc(sci, pose, com, SKETCH_VERSION);
   }
-  function openDetailModal(sci) {
+  function openDetailModal(sci, options) {
     if (!sci) return;
+    var refreshingDetail = options && options.refresh;
     if (PUBLIC_STATIC_MODE && !snapshotCurrentIndex && typeof publicInitialDataLoad === 'object' && publicInitialDataLoad) {
       var waitingHash = readHash();
       publicInitialDataLoad.then(function () {
@@ -2499,7 +2664,14 @@
       return;
     }
     var detailRecent = SNAPSHOT_CDN ? DATA.recent : null;
+    var detailGeneration = snapshotCurrentIndex && snapshotCurrentIndex.generation;
+    var detailSequence = ++snapshotDetailSequence;
     var modal = document.getElementById('detail-modal');
+    if (refreshingDetail) stopModalAudio();
+    function currentDetail() {
+      return detailSequence === snapshotDetailSequence &&
+        document.getElementById('modalSci').textContent === sci && modal.getAttribute('aria-hidden') === 'false';
+    }
     var img = document.getElementById('modalImg');
     var poseToggle = document.getElementById('modalPoseToggle');
     var poseBtns = [].slice.call(poseToggle.querySelectorAll('button'));
@@ -2532,6 +2704,11 @@
           .then(function (ok) { return { pose: pose, btn: b, ok: ok }; });
       }));
     }).then(function (results) {
+      if (SNAPSHOT_CDN && snapshotCurrentIndex && snapshotCurrentIndex.generation !== detailGeneration) return;
+      updateDetailPoses(results);
+    });
+    function updateDetailPoses(results) {
+      if (SNAPSHOT_CDN && !currentDetail()) return;
       if (document.getElementById('modalSci').textContent !== sci) return;
       var available = results.filter(function (r) { return r.ok; });
       available.forEach(function (r) { r.btn.removeAttribute('data-unavailable'); });
@@ -2546,14 +2723,14 @@
           b.setAttribute('aria-current', b === pick.btn ? 'true' : 'false');
         });
         setMediaImage(img, sketchSrc(sci, pick.pose));
-      }
+      } else if (MEDIA_CDN) setMediaImage(img, '');
       // Single-option => hide the chrome.
       if (available.length <= 1) {
         poseToggle.setAttribute('data-unavailable', 'true');
-      }
+      } else poseToggle.removeAttribute('data-unavailable');
       // Slide the white pill to the active button.
       syncPill(poseToggle);
-    });
+    }
     document.getElementById('modalSci').textContent = sci;
     document.getElementById('modalGenus').textContent = (sci.split(' ')[0] || '-');
     document.getElementById('modalCommon').textContent = '-';
@@ -2589,7 +2766,7 @@
       : null;
     modal.setAttribute('aria-hidden', 'false');
     document.body.style.overflow = 'hidden';
-    morphModalOpen(modal.querySelector('.modal-card'), sourceCard);
+    if (!refreshingDetail) morphModalOpen(modal.querySelector('.modal-card'), sourceCard);
 
     // Species detail (lifelist row + every detection).
     var cachedSpecies = SPECIES_CACHE[sci];
@@ -2597,21 +2774,30 @@
         cachedSpecies.snapshot.generation !== snapshotCurrentIndex.generation)) cachedSpecies = null;
     var loadSpecies = cachedSpecies
       ? Promise.resolve(cachedSpecies)
-      : fetchJson('./avian/api/birdnet-api.php?action=species&sci=' + encodeURIComponent(sci)).then(function (j) {
-          if (!SNAPSHOT_CDN || (snapshotCurrentIndex && j.snapshot &&
+      : fetchJson('./avian/api/birdnet-api.php?action=species&sci=' + encodeURIComponent(sci),
+          { accept: currentDetail }).then(function (j) {
+          if (!SNAPSHOT_CDN || (currentDetail() && snapshotCurrentIndex && j.snapshot &&
               j.snapshot.generation === snapshotCurrentIndex.generation)) SPECIES_CACHE[sci] = j;
           return j;
         });
     loadSpecies.then(function (j) {
+      if (SNAPSHOT_CDN && !currentDetail()) return;
       if (document.getElementById('modalSci').textContent !== sci) return;
       if (PUBLIC_STATIC_MODE && (!snapshotCurrentIndex || !j.snapshot || j.snapshot.generation !== snapshotCurrentIndex.generation)) {
         document.getElementById('modalRecordings').innerHTML = '<li class="rec-empty">Bird data updated. Reopen this bird to refresh recordings.</li>';
         return;
       }
+      if (SNAPSHOT_CDN && j.snapshot.generation !== detailGeneration) {
+        updateDetailPoses(poseBtns.map(function (button) {
+          var pose = +button.dataset.pose;
+          return { pose: pose, btn: button, ok: !!sketchSrc(sci, pose) };
+        }));
+      }
       var s = j.summary || {};
       document.getElementById('modalCommon').textContent = s.com || sci;
       document.getElementById('modalAllTime').textContent = (+s.total || 0).toLocaleString();
-      var modalRecent = detailRecent || DATA.recent;
+      var modalRecent = detailRecent && (!SNAPSHOT_CDN || (j.snapshot && detailRecent.snapshot &&
+        detailRecent.snapshot.generation === j.snapshot.generation)) ? detailRecent : DATA.recent;
       var winRow = ((modalRecent && modalRecent.species) || []).filter(function (x) { return x.sci === sci; })[0];
       document.getElementById('modalWindow').textContent = (winRow ? +winRow.n : 0).toLocaleString();
       document.getElementById('modalFirstSeen').textContent = s.first_seen ? fmtRecTime(s.first_seen.split(' ')[0], s.first_seen.split(' ')[1]) : '-';
@@ -2639,8 +2825,11 @@
               + '</li>';
           }).join('')
         : '<li class="rec-empty">No recordings yet.</li>';
-    }).catch(function () {
-      document.getElementById('modalRecordings').innerHTML = '<li class="rec-empty">Failed to load recordings.</li>';
+    }).catch(function (error) {
+      if (SNAPSHOT_CDN && !currentDetail()) return;
+      var message = error.obsolete ? 'Bird data updated. Reopen this bird to refresh recordings.' :
+        error.retiredMetadata ? 'Bird data is unavailable for this bird.' : 'Failed to load recordings.';
+      document.getElementById('modalRecordings').innerHTML = '<li class="rec-empty">' + message + '</li>';
     });
 
     // Wikipedia summary (description + genus / family).
@@ -2650,16 +2839,19 @@
           WIKI_CACHE[sci] = j; return j;
         });
     loadWiki.then(function (j) {
+      if (SNAPSHOT_CDN && !currentDetail()) return;
       var desc = document.getElementById('modalDesc');
       desc.textContent = j.extract || 'No description available.';
       desc.classList.toggle('placeholder', !j.extract);
     }).catch(function () {
+      if (SNAPSHOT_CDN && !currentDetail()) return;
       var desc = document.getElementById('modalDesc');
       desc.textContent = 'No description available.';
       desc.classList.add('placeholder');
     });
   }
   function closeDetailModal() {
+    snapshotDetailSequence++;
     var modal = document.getElementById('detail-modal');
     stopModalAudio();
     // Reverse-morph back into the source atlas card so the modal

@@ -65,3 +65,6 @@ avian/cdn/state/
 avian/cdn/.env
 avian/cdn/.env.*
 !avian/cdn/.env.example
+avian/cdn/publisher.env
+avian/cdn/publisher.env.*
+!avian/cdn/publisher.env.example
